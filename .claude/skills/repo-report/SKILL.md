@@ -1,112 +1,186 @@
 ---
 name: repo-report
-description: Run the local bin/repo-report CLI in non-interactive JSON mode against a workspace and summarise which repos are behind / ahead / diverged / dirty. Trigger when the user asks "what's the state of my repos", "are all my checkouts up to date", "show me the repo report", or types /repo-report. NEVER launch the interactive TUI from this skill — always pass --non-interactive --format json so output stays machine-parsable.
+description: TUI launcher for the repo-report interactive terminal dashboard. Resolve the bin/repo-report binary and a scan root, then hand the user a ready-to-copy command that launches the full-screen news-ticker TUI in their own terminal. Trigger on "launch repo-report", "show me the repo dashboard", "open the repo TUI", or explicit /repo-report. Claude CANNOT drive a TUI from this skill — do not execute the TUI command from the Bash tool. Only run the binary in --non-interactive --format json mode if the user explicitly asks for data instead of the TUI.
 ---
 
-# /repo-report
+# /repo-report — TUI launcher
 
-Drives the repository's own `bin/repo-report` tool to produce a
-data-driven status summary of every git checkout under a workspace,
-without requiring the user to read a 200-row table by hand.
+`bin/repo-report` is a pure-Bash + ANSI full-screen TUI with a scrolling
+LIVE news-ticker reporter and streaming result list. Claude Code
+**cannot drive a TUI** — the alt-screen protocol, raw input, and the
+reporter animation all require a real user-facing terminal. So this
+skill's job is to prepare everything the user needs and then **hand
+off** a command line; it does not try to run the TUI on their behalf.
 
 ## Steps
 
-1. **Resolve scan root**, in this order of precedence:
-   1. An explicit path in the user's request
-   2. `$REPO_REPORT_ROOT` environment variable
-   3. A directory that contains a `.repo/` subdirectory (search from cwd upward one or two levels)
-   4. `.` (current working directory)
+### 1. Resolve the binary
 
-2. **Locate the CLI.** Prefer in this order:
-   1. `./bin/repo-report` (repo checkout)
-   2. `repo-report` on `$PATH`
+Check, in order:
 
-   If neither exists, stop and tell the user to install it with
-   `install -m0755 bin/repo-report /usr/local/bin/` from the
-   `nigoh/repo_report` checkout. Do not silently fall back to raw
-   `git status` loops.
+1. `./bin/repo-report` (repo checkout — this is the expected path
+   when working inside `nigoh/repo_report`).
+2. `repo-report` on `$PATH`.
 
-3. **Run the scan** with machine-readable output:
+If neither exists, print the install snippet and stop:
 
-   ```bash
-   <cli> --non-interactive --format json [--fetch] [-j N] <root>
-   ```
+```sh
+install -m0755 bin/repo-report /usr/local/bin/repo-report
+# or, for a user install:
+ln -s "$PWD/bin/repo-report" ~/.local/bin/repo-report
+```
 
-   - Add `--fetch` **only** if the user explicitly asked for a network
-     refresh (phrases like "latest", "after pull", "fetch first").
-     Skip it for a local-only snapshot — `--fetch` can be slow across
-     hundreds of repos.
-   - Add `-j 32` (or similar) if the user complains about speed and
-     the scan is I/O-bound against network.
-   - Never pass `--interactive` or run the tool in a TTY-only mode
-     from this skill — this skill's whole point is producing JSON
-     that Claude can summarise.
+Do not silently fall back to raw `git status` loops — the skill's
+value is the TUI, not reinventing it.
 
-4. **Parse the JSON.** Each element has keys:
-   `repo, branch, sha, date, ahead, behind, dirty, status, remote, message`.
+### 2. Resolve the scan root
 
-5. **Aggregate** into:
-   - `total` — number of repos scanned
-   - `up_to_date` — `status == "up-to-date"` and `dirty == "clean"`
-   - `behind` — `status == "behind"`
-   - `ahead` — `status == "ahead"`
-   - `diverged` — `status == "diverged"`
-   - `dirty` — `dirty == "dirty"`
-   - `no_upstream` — `status == "no-upstream"`
+Check, in order:
 
-6. **Report** in this shape (Markdown):
+1. An explicit path in the user's message.
+2. The `$REPO_REPORT_ROOT` environment variable.
+3. A directory containing a `.repo/` subdirectory — search the
+   current working directory and, if not found, its parent. This
+   matches the common layout for Google `repo`-tool workspaces.
+4. `.` (the current working directory).
 
-   ```
-   ## Repo report for <root> (<total> repos)
+### 3. Sanity-check the binary
 
-   - ✅ up-to-date + clean: <n>
-   - 🟡 behind: <n>
-   - 🔵 ahead: <n>
-   - 🔴 diverged: <n>
-   - ⚠️  dirty: <n>
-   - ⚫ no upstream: <n>
-   ```
+Run `<cli> --version` (via the `Bash` tool) — it is fast, has no
+TUI side effects, and only prints the version string. If it exits
+non-zero, show the exact stderr and stop.
 
-   Then a "needs attention" section listing **up to 20** worst offenders,
-   prioritising in this order:
-   1. `diverged` (most urgent — manual resolution)
-   2. `dirty` (uncommitted work at risk)
-   3. `behind >= 5`
-   4. Everything else `behind`
+Do **not** run `<cli> --help` inside a pager; just read the output.
+Do **not** run `<cli> <root>` without `--format` or `-n` — that
+would try to launch the TUI from Claude's Bash sandbox, which will
+either hang the tool call or corrupt the parent terminal.
 
-   For each offender, show:
-   `<repo>  <branch>  <sha>  <status>  +<ahead>/-<behind>  "<message>"`.
+### 4. Emit a ready-to-copy launch block
 
-7. **Suggest next actions**, but **do not run them**:
-   - For pure-behind repos: suggest `git -C <path> pull --ff-only`.
-   - For diverged repos: suggest opening them for manual inspection;
-     flag that rebase vs merge is a decision only the user should make.
-   - For dirty repos: suggest `git -C <path> status` to see the changes.
-   - If everything is clean + up-to-date, say so in a single sentence
-     and stop — no action suggestions needed.
+Print this exact shape to the user, with `<cli>` and `<root>`
+substituted with the real values you resolved:
+
+```
+# Launch the repo-report TUI on <root>
+
+    <cli> <root>
+
+Keys:
+    j / k / ↑ / ↓   move cursor
+    /               filter repos (type query, Enter to apply)
+    f               toggle fetch + rescan
+    r               rescan
+    q / Ctrl-C      quit (terminal is restored automatically)
+
+If you want the data without opening the TUI:
+
+    <cli> --non-interactive --format json <root>       # machine-readable
+    <cli> --format tsv <root>                          # pipe into awk
+    <cli> --format table <root>                        # pretty, non-interactive
+```
+
+Tell the user that the TUI needs to run in their own terminal — if
+they are in a Claude Code session attached to a terminal, they can
+paste the command directly; if they are in a web / headless session,
+they will need to SSH in and run it there.
+
+### 5. Do NOT execute the TUI command
+
+Hard rule. The `Bash` tool runs commands in a sandbox whose stdout
+is captured, not connected to the user's terminal. Running the TUI
+command from Claude will:
+
+- enter the alt screen inside the sandbox and never exit
+- or print escape codes as literal text and corrupt Claude's output
+- or leave `stty` in raw mode in the parent shell
+
+**Only invoke `<cli>` from Bash with `--format <something>` or
+`--non-interactive`.** Never bare.
+
+### 6. Non-interactive fallback (opt-in only)
+
+If the user explicitly says "I just want the data", "don't open the
+TUI", "summarise", "what's the state of my repos", or similar, run:
+
+```bash
+<cli> --non-interactive --format json [--fetch] <root>
+```
+
+- Add `--fetch` only if they asked for a network refresh ("latest",
+  "after pull", "check remotes"). It is slow on workspaces with
+  hundreds of checkouts.
+- Parse the JSON array. Each element has keys
+  `repo, branch, sha, date, ahead, behind, dirty, status, remote, message`.
+- Aggregate into counts: `total`, `up_to_date`
+  (`status=="up-to-date" && dirty=="clean"`), `behind`, `ahead`,
+  `diverged`, `dirty`, `no_upstream`.
+- Produce a Markdown summary shaped like:
+
+  ```
+  ## Repo report for <root> (<total> repos)
+
+  - ✅ up-to-date + clean: <n>
+  - 🟡 behind: <n>
+  - 🔵 ahead: <n>
+  - 🔴 diverged: <n>
+  - ⚠️  dirty: <n>
+  - ⚫ no upstream: <n>
+  ```
+
+- Then a "needs attention" section of up to 20 worst offenders,
+  prioritised in this order:
+  1. `diverged` (manual resolution)
+  2. `dirty` (uncommitted work at risk)
+  3. `behind >= 5`
+  4. Everything else `behind`
+
+  For each offender show
+  `<repo>  <branch>  <sha>  <status>  +<ahead>/-<behind>  "<message>"`.
+
+- Suggest next actions but **do not run them**: `git -C <path> pull
+  --ff-only` for pure-behind repos, manual inspection for diverged,
+  `git -C <path> status` for dirty. If everything is clean + up-to-date,
+  say so in one sentence and stop.
 
 ## Rules
 
-- **Never mutate git state.** No pull, push, fetch (except via the
-  `--fetch` flag on `repo-report` itself), reset, checkout, etc.
-  This skill is a reporter, not an agent.
-- **Never start the interactive TUI.** If you find yourself running
-  `repo-report <path>` without `--non-interactive --format json`, you
-  have made a mistake — Claude cannot drive a TUI.
-- **Error-code awareness.** If the CLI exits with an `RRxxx` error
-  on stderr, surface the code to the user and link to
-  `docs/errors.md#RRxxx`.
-- **Respect exit codes**: the CLI exits `1` if anything is dirty,
-  behind, ahead, or diverged. Use this as a quick yes/no before
-  diving into JSON parsing, but still produce a detailed summary so
-  the user sees *what* is off.
+- **Never mutate git state.** No pull, push, reset, checkout, etc.
+  The only `git fetch` allowed is the one triggered by the CLI's own
+  `--fetch` flag in the non-interactive fallback path.
+- **Never launch the TUI from the `Bash` tool.** Only non-interactive
+  invocations of `<cli>`.
+- **Respect error codes.** If `<cli>` exits with `[RRxxx] …` on
+  stderr, surface the code and link the user to
+  `docs/errors.md#RRxxx` (e.g. `RR201` for a bad path, `RR203` for
+  "no repos found", `RR402` for "terminal too small").
+- **Don't second-guess the user's terminal.** If they say "I'm in
+  tmux / iTerm / Kitty", trust them. If they say "I'm on the web
+  app", tell them the TUI needs a real terminal.
 
-## Example invocation
+## Example interaction
 
-```bash
-./bin/repo-report --non-interactive --format json --fetch /home/user/android
+> User: /repo-report /home/user/android
+
+Skill resolves `<cli>` = `./bin/repo-report`, `<root>` = `/home/user/android`,
+runs `./bin/repo-report --version` to confirm it works, then replies:
+
+```
+# Launch the repo-report TUI on /home/user/android
+
+    ./bin/repo-report /home/user/android
+
+Keys:
+    j / k / ↑ / ↓   move cursor
+    /               filter repos (type query, Enter to apply)
+    f               toggle fetch + rescan
+    r               rescan
+    q / Ctrl-C      quit (terminal is restored automatically)
+
+If you want the data without opening the TUI:
+
+    ./bin/repo-report --non-interactive --format json /home/user/android
+    ./bin/repo-report --format tsv /home/user/android
+    ./bin/repo-report --format table /home/user/android
 ```
 
-Parse the resulting JSON array, produce the Markdown summary above,
-and stop. Do not offer to run git commands on the user's behalf
-unless they explicitly ask.
+Then stops.

@@ -135,9 +135,15 @@ See [`docs/errors.md`](docs/errors.md) for the full catalogue.
 
 This repo ships a sub-agent and a slash-command skill under `.claude/`:
 
-- **`cli-reporter` agent** (`.claude/agents/cli-reporter.md`) —
-  specialised for future Bash / TUI edits to this codebase.
+- **`tui-reporter` agent** (`.claude/agents/tui-reporter.md`) —
+  a pure-Bash + ANSI TUI specialist. Use it for any full-screen
+  Bash tool under `bin/`, not just `repo-report`. It knows the
+  alt-screen / raw-input / FIFO-streaming / news-ticker patterns
+  and the invariants every TUI in this repo must preserve.
 - **`/repo-report` skill** (`.claude/skills/repo-report/SKILL.md`) —
-  drives `bin/repo-report --non-interactive --format json` and
-  summarises the result so Claude can answer "what's the state of
-  my repos?" without eyeballing a 200-row table.
+  a **TUI launcher**. Resolves `bin/repo-report` and a scan root,
+  then hands you a ready-to-copy command that opens the interactive
+  dashboard in your own terminal. Claude Code cannot drive a TUI,
+  so the skill deliberately does not try to run it from the `Bash`
+  tool. If you explicitly ask for "just the data" instead, it falls
+  back to `--non-interactive --format json` and summarises.
