@@ -2,6 +2,13 @@
 name = "repo-report"
 version = "0.3.0"
 edition = "2021"
+description = "Interactive TUI for monitoring git repository status across a workspace"
+authors = ["nigoh"]
+license = "MIT"
+repository = "https://github.com/nigoh/repo_report"
+keywords = ["git", "tui", "workspace", "aosp", "repo"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [[bin]]
 name = "repo-report-tui"
