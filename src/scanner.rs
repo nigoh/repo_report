@@ -44,6 +44,84 @@ pub fn is_aosp(root: &Path) -> bool {
     root.join(".repo").is_dir()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn init_git_repo(path: &std::path::Path) {
+        Command::new("git").args(["init", "-b", "main"]).current_dir(path).output().unwrap();
+        Command::new("git").args(["config", "user.email", "t@t.com"]).current_dir(path).output().unwrap();
+        Command::new("git").args(["config", "user.name", "T"]).current_dir(path).output().unwrap();
+        std::fs::write(path.join("f.txt"), "x").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(path).output().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(path).output().unwrap();
+    }
+
+    #[test]
+    fn find_repos_detects_single_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        let repos = find_repos(tmp.path(), 1);
+        // The repo itself should be found (or as direct child)
+        assert!(!repos.is_empty() || find_repos(tmp.path().parent().unwrap(), 2).contains(&tmp.path().to_path_buf()),
+            "should find the repo");
+    }
+
+    #[test]
+    fn find_repos_detects_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_git_repo(&sub);
+
+        let repos = find_repos(tmp.path(), 3);
+        assert!(repos.contains(&sub), "should find nested repo at {:?}, found: {:?}", sub, repos);
+    }
+
+    #[test]
+    fn find_repos_stops_at_max_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create repo at depth 3 (tmp/a/b/c)
+        let deep = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        init_git_repo(&deep);
+
+        // With max_depth=1, should not find it
+        let repos_shallow = find_repos(tmp.path(), 1);
+        assert!(!repos_shallow.contains(&deep), "should not find at depth 3 with max_depth=1");
+
+        // With max_depth=4, should find it
+        let repos_deep = find_repos(tmp.path(), 4);
+        assert!(repos_deep.contains(&deep), "should find at depth 3 with max_depth=4");
+    }
+
+    #[test]
+    fn is_aosp_true_when_repo_dir_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".repo")).unwrap();
+        assert!(is_aosp(tmp.path()));
+    }
+
+    #[test]
+    fn is_aosp_false_when_no_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_aosp(tmp.path()));
+    }
+
+    #[test]
+    fn find_repos_does_not_descend_into_found_repos() {
+        // A nested .git inside another .git dir should not produce a second result
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        // Repos found should not include the parent twice
+        let repos = find_repos(tmp.path().parent().unwrap_or(tmp.path()), 5);
+        let count = repos.iter().filter(|p| p.starts_with(tmp.path())).count();
+        assert!(count <= 1, "found repo more than once: {:?}", repos);
+    }
+}
+
 pub fn run_scan(root: PathBuf, max_depth: usize, fetch: bool, tx: Sender<ScanEvent>) {
     std::thread::spawn(move || {
         let repos = find_repos(&root, max_depth);

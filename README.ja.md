@@ -1,6 +1,16 @@
 # repo_report
 
-![repo-report demo](demo.gif)
+**Bash 版**（`bin/repo-report`）
+
+![repo-report Bash 版 demo](demo.gif)
+
+**Ratatui/Rust 版**（`repo-report-tui`）— 通常ワークスペース
+
+![repo-report-tui 通常モード](demo-tui.svg)
+
+**Ratatui/Rust 版** — AOSP ワークスペース（`.repo/` 検出時）
+
+![repo-report-tui AOSP モード](demo-tui-aosp.svg)
 
 `repo-report` は単一ファイルの Bash CLI です。ディレクトリツリーを走査し、ネストされたすべての git リポジトリ（`.git` ディレクトリおよび `.git` gitfile ポインタ — Google の `repo` ツールやサブモジュールで使用される形式）を検出してそのステータスを表示します。2 つのモードがあります：
 

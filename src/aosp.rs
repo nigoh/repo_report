@@ -141,3 +141,99 @@ fn read_manifest(root: &PathBuf, tx: &Sender<AospEvent>) {
 fn send_err(tx: &Sender<AospEvent>, msg: &str) {
     let _ = tx.send(AospEvent::Line(format!("[err] {}", msg)));
 }
+
+/// Check if a `repo forall -c` command would be blocked.
+/// Exposed for testing; the main path calls this inline via `run_aosp_op`.
+pub fn is_forall_blocked(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    FORALL_BLOCKLIST.iter().any(|pat| lower.contains(pat))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::path::PathBuf;
+
+    // ── Forall blocklist ──────────────────────────────────────────────────────
+
+    #[test]
+    fn blocklist_catches_reset_hard() {
+        assert!(is_forall_blocked("git reset --hard HEAD"));
+        assert!(is_forall_blocked("GIT RESET --HARD HEAD")); // case-insensitive
+    }
+
+    #[test]
+    fn blocklist_catches_clean_f() {
+        assert!(is_forall_blocked("git clean -f"));
+        assert!(is_forall_blocked("git clean -fd"));
+    }
+
+    #[test]
+    fn blocklist_catches_rm_rf() {
+        assert!(is_forall_blocked("rm -rf /tmp/foo"));
+        assert!(is_forall_blocked("rm -fr /tmp/foo"));
+    }
+
+    #[test]
+    fn blocklist_catches_force_push() {
+        assert!(is_forall_blocked("git push --force"));
+        assert!(is_forall_blocked("git push -f origin main"));
+    }
+
+    #[test]
+    fn blocklist_allows_safe_commands() {
+        assert!(!is_forall_blocked("git log -1 --oneline"));
+        assert!(!is_forall_blocked("git status"));
+        assert!(!is_forall_blocked("git diff HEAD~1"));
+        assert!(!is_forall_blocked("git fetch --all"));
+        assert!(!is_forall_blocked("git branch -a"));
+    }
+
+    // ── Manifest reading ──────────────────────────────────────────────────────
+
+    #[test]
+    fn read_manifest_streams_lines_and_signals_done() {
+        // Create a temp dir with a fake manifest
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join(".repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("manifest.xml"),
+            "<?xml version=\"1.0\"?>\n<manifest>\n  <default revision=\"main\"/>\n</manifest>\n",
+        ).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let root = PathBuf::from(tmp.path());
+        read_manifest(&root, &tx);
+        drop(tx); // ensure channel is closed
+
+        let mut lines = Vec::new();
+        let mut done = None;
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                AospEvent::Line(l) => lines.push(l),
+                AospEvent::Done(ok) => done = Some(ok),
+            }
+        }
+
+        assert!(!lines.is_empty(), "expected manifest lines");
+        assert!(lines.iter().any(|l| l.contains("manifest")));
+        assert_eq!(done, Some(true));
+    }
+
+    #[test]
+    fn read_manifest_errors_when_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = mpsc::channel();
+        let root = PathBuf::from(tmp.path());
+        read_manifest(&root, &tx);
+        drop(tx);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.recv().ok()).collect();
+        let has_err = events.iter().any(|e| matches!(e, AospEvent::Line(l) if l.contains("[err]")));
+        let done_false = events.iter().any(|e| matches!(e, AospEvent::Done(false)));
+        assert!(has_err);
+        assert!(done_false);
+    }
+}
