@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Unit tests
+        run: cargo test
+      - name: Integration tests (non-interactive)
+        run: bash tests/test_rust_noninteractive.sh
+
+  test-bash:
+    name: Bash script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n bin/repo-report
+      - name: Non-interactive tests
+        run: bash tests/test_noninteractive.sh
+      - name: Repo detection tests
+        run: bash tests/test_repo_detection.sh
+      - name: Repo commands tests
+        run: bash tests/test_repo_commands.sh
