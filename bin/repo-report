@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# repo-report: scan nested git repositories in parallel and report
+#              branch / HEAD / dirty / ahead-behind / up-to-date status.
+#
+# Two modes:
+#   - Interactive TUI (default on a TTY): animated "news ticker" reporter
+#     at the top, streaming results, filter/fetch/rescan/quit keys.
+#   - Non-interactive (--format, --non-interactive, or piped stdout):
+#     table / TSV / JSON for pipelines and CI.
+#
+# Dependencies: bash >= 4, git, find, xargs, awk, mkfifo. `column` optional.
+
+set -uo pipefail
+
+VERSION="0.2.0"
+ROOT="."
+JOBS="$(nproc 2>/dev/null || echo 4)"
+FETCH=0
+FORMAT=""
+NON_INTERACTIVE=0
+MAX_DEPTH=""
+MSG_WIDTH=60
+ERR_DOC_URL="https://github.com/nigoh/repo_report/blob/main/docs/errors.md"
+
+# ------------------------------------------------------------------
+# Error helper: numbered RRxxx codes. All user-visible errors go
+# through this so format stays consistent.
+#   err CODE "message" [exit_status]
+# ------------------------------------------------------------------
+err() {
+  local code="$1" msg="$2" rc="${3:-1}"
+  if [[ "${_TUI_ON:-0}" -eq 1 ]]; then _tui_teardown; fi
+  printf 'repo-report: [%s] %s\n' "$code" "$msg" >&2
+  printf '  -> see: %s#%s\n' "$ERR_DOC_URL" "$code" >&2
+  exit "$rc"
+}
+
+usage() {
+  cat <<EOF
+repo-report v${VERSION}
+  Scan a directory tree for git repositories and report their status
+  in parallel. Interactive news-ticker TUI by default; machine-readable
+  table / TSV / JSON for pipelines and CI.
+
+Usage:
+  repo-report [OPTIONS] [PATH]
+
+Options:
+  -j, --jobs N         Parallel workers (default: nproc = ${JOBS})
+  -f, --fetch          git fetch each repo before reporting (network)
+      --format FMT     Output format: table | tsv | json (forces non-interactive)
+  -n, --non-interactive
+                       Force non-interactive output (default format: tsv)
+      --max-depth N    Limit find depth
+      --msg-width N    Truncate commit message in table (default 60)
+  -h, --help           Show this help
+  -V, --version        Show version
+
+Behavior:
+  - TTY + no --format/-n  -> interactive TUI with animated LIVE ticker
+  - piped / redirected    -> TSV
+  - --format explicit     -> that format (non-interactive)
+
+Interactive keys:
+  j/k or arrows  move      /  filter       f  toggle fetch+rescan
+  r  rescan      q  quit
+
+Error codes: see ${ERR_DOC_URL}
+EOF
+}
+
+# ------------------------------------------------------------------
+# Argument parsing
+# ------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -j|--jobs)
+      [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || err RR103 "--jobs must be a positive integer" 2
+      JOBS="$2"; shift 2;;
+    -f|--fetch)          FETCH=1; shift;;
+    --format)
+      case "${2:-}" in
+        table|tsv|json) FORMAT="$2" ;;
+        *) err RR102 "--format must be one of: table, tsv, json" 2 ;;
+      esac
+      shift 2;;
+    -n|--non-interactive) NON_INTERACTIVE=1; shift;;
+    --max-depth)
+      [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || err RR104 "--max-depth must be a positive integer" 2
+      MAX_DEPTH="$2"; shift 2;;
+    --msg-width)
+      [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || err RR104 "--msg-width must be a positive integer" 2
+      MSG_WIDTH="$2"; shift 2;;
+    -h|--help)           usage; exit 0;;
+    -V|--version)        echo "$VERSION"; exit 0;;
+    --)                  shift; ROOT="${1:-.}"; shift || true;;
+    -*)                  err RR101 "unknown option: $1" 2;;
+    *)                   ROOT="$1"; shift;;
+  esac
+done
+
+# Dependency check
+for bin in git find xargs awk; do
+  command -v "$bin" >/dev/null 2>&1 || {
+    case "$bin" in
+      git) err RR301 "git binary not found on PATH" 127 ;;
+      *)   err RR501 "required dependency missing: $bin" 127 ;;
+    esac
+  }
+done
+
+# Path check
+[[ -e "$ROOT" ]] || err RR201 "path does not exist: $ROOT" 1
+[[ -d "$ROOT" ]] || err RR201 "path is not a directory: $ROOT" 1
+[[ -r "$ROOT" ]] || err RR202 "path is not readable: $ROOT" 1
+
+# ------------------------------------------------------------------
+# Discovery
+# ------------------------------------------------------------------
+scan_paths() {
+  local find_opts=()
+  [[ -n "$MAX_DEPTH" ]] && find_opts+=(-maxdepth "$MAX_DEPTH")
+  find "$ROOT" "${find_opts[@]}" -name .git \( -type d -o -type f \) -prune 2>/dev/null | sort -u
+}
+
+mapfile -t GIT_PATHS < <(scan_paths)
+
+if [[ ${#GIT_PATHS[@]} -eq 0 ]]; then
+  printf 'repo-report: [RR203] no git repositories found under: %s\n' "$ROOT" >&2
+  exit 0
+fi
+
+# ------------------------------------------------------------------
+# Worker: one TSV line per repo. Writes < PIPE_BUF so xargs -P is
+# atomic on stdout.
+# ------------------------------------------------------------------
+_report_one() {
+  local gitpath="$1"
+  local repo="${gitpath%/.git}"
+  [[ -z "$repo" ]] && repo="."
+
+  local branch sha date msg remote upstream ahead behind dirty status porcelain
+
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  [[ "$branch" == "HEAD" ]] && branch="(detached)"
+  sha=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo "-")
+  date=$(git -C "$repo" log -1 --format=%cI 2>/dev/null || echo "-")
+  msg=$(git -C "$repo" log -1 --format=%s 2>/dev/null | tr '\t\r\n' '   ')
+  remote=$(git -C "$repo" config --get remote.origin.url 2>/dev/null || echo "-")
+
+  if [[ "${REPO_REPORT_FETCH:-0}" -eq 1 ]]; then
+    git -C "$repo" fetch --quiet --all --prune 2>/dev/null || true
+  fi
+
+  upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  ahead=0; behind=0
+  if [[ -n "$upstream" ]]; then
+    read -r ahead behind < <(git -C "$repo" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null) || { ahead=0; behind=0; }
+  fi
+
+  porcelain=$(git -C "$repo" status --porcelain 2>/dev/null || true)
+  if [[ -n "$porcelain" ]]; then dirty="dirty"; else dirty="clean"; fi
+
+  if [[ -z "$upstream" ]]; then status="no-upstream"
+  elif [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then status="up-to-date"
+  elif [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then status="diverged"
+  elif [[ "$behind" -gt 0 ]]; then status="behind"
+  else status="ahead"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$repo" "$branch" "$sha" "$date" "$ahead" "$behind" "$dirty" "$status" "$remote" "$msg"
+}
+export -f _report_one
+export REPO_REPORT_FETCH="$FETCH"
+
+run_scan_sync() {
+  printf '%s\0' "${GIT_PATHS[@]}" \
+    | xargs -0 -n1 -P "$JOBS" bash -c '_report_one "$1"' bash \
+    | sort
+}
+
+# ------------------------------------------------------------------
+# Non-interactive emitters
+# ------------------------------------------------------------------
+emit_tsv() {
+  printf 'repo\tbranch\tsha\tdate\tahead\tbehind\tdirty\tstatus\tremote\tmessage\n'
+  printf '%s\n' "$1"
+}
+
+emit_table() {
+  local w="$MSG_WIDTH"
+  {
+    printf 'REPO\tBRANCH\tSHA\tDATE\tA\tB\tDIRTY\tSTATUS\tMESSAGE\n'
+    printf '%s\n' "$1" \
+      | awk -F'\t' -v W="$w" 'BEGIN{OFS="\t"}
+          { m=$10; if (length(m) > W) m=substr(m,1,W-1) "…";
+            d=$4; if (length(d) >= 10) d=substr(d,1,10);
+            print $1,$2,$3,d,$5,$6,$7,$8,m }'
+  } | { command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat; }
+}
+
+emit_json() {
+  printf '%s\n' "$1" | awk -F'\t' '
+    function esc(s,   r){ r=s;
+      gsub(/\\/, "\\\\", r);
+      gsub(/"/,  "\\\"", r);
+      gsub(/\t/, "\\t",  r);
+      gsub(/\n/, "\\n",  r);
+      gsub(/\r/, "\\r",  r);
+      return r
+    }
+    BEGIN{ print "["; first=1 }
+    NF==0 { next }
+    {
+      if (!first) printf ",\n"; first=0
+      printf "  {\"repo\":\"%s\",\"branch\":\"%s\",\"sha\":\"%s\",\"date\":\"%s\",\"ahead\":%d,\"behind\":%d,\"dirty\":\"%s\",\"status\":\"%s\",\"remote\":\"%s\",\"message\":\"%s\"}",
+        esc($1), esc($2), esc($3), esc($4), $5+0, $6+0, esc($7), esc($8), esc($9), esc($10)
+    }
+    END{ if (!first) printf "\n"; print "]" }
+  '
+}
+
+final_exit_code() {
+  printf '%s\n' "$1" | awk -F'\t' '
+    $7!="clean" || ($8!="up-to-date" && $8!="no-upstream") { bad=1 }
+    END{ exit bad?1:0 }'
+}
+
+# ------------------------------------------------------------------
+# Mode selection
+# ------------------------------------------------------------------
+WANT_INTERACTIVE=0
+if [[ -n "$FORMAT" ]]; then
+  WANT_INTERACTIVE=0
+elif [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+  WANT_INTERACTIVE=0
+  FORMAT="tsv"
+elif [[ -t 1 ]]; then
+  WANT_INTERACTIVE=1
+else
+  WANT_INTERACTIVE=0
+  FORMAT="tsv"
+fi
+
+if [[ "$WANT_INTERACTIVE" -eq 0 ]]; then
+  TSV=$(run_scan_sync)
+  case "$FORMAT" in
+    table) emit_table "$TSV" ;;
+    tsv)   emit_tsv   "$TSV" ;;
+    json)  emit_json  "$TSV" ;;
+  esac
+  if final_exit_code "$TSV"; then exit 0; else exit 1; fi
+fi
+
+# ==================================================================
+# Interactive TUI
+# ==================================================================
+
+[[ -t 0 && -t 1 ]] || err RR401 "interactive mode requires a TTY" 2
+
+TERM_ROWS=24; TERM_COLS=80
+_query_size() {
+  local sz
+  if sz=$(stty size 2>/dev/null); then
+    TERM_ROWS="${sz% *}"; TERM_COLS="${sz#* }"
+  fi
+  [[ "$TERM_ROWS" -ge 10 && "$TERM_COLS" -ge 20 ]] || err RR402 "terminal too small (need >= 20x10)" 2
+}
+_query_size
+
+_TUI_ON=0
+SCAN_PID=""
+FIFO=""
+
+_tui_setup() {
+  printf '\e[?1049h\e[?25l'
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  _TUI_ON=1
+}
+_tui_teardown() {
+  [[ "${_TUI_ON:-0}" -eq 1 ]] || return 0
+  _TUI_ON=0
+  stty sane 2>/dev/null || true
+  printf '\e[?25h\e[?1049l'
+}
+_cleanup() {
+  if [[ -n "$SCAN_PID" ]]; then
+    kill "$SCAN_PID" 2>/dev/null || true
+    wait "$SCAN_PID" 2>/dev/null || true
+  fi
+  exec 3<&- 2>/dev/null || true
+  [[ -n "$FIFO" && -e "$FIFO" ]] && rm -f "$FIFO"
+  _tui_teardown
+}
+trap _cleanup EXIT
+trap 'RESIZE=1' WINCH
+trap 'exit 130' INT TERM
+
+RESIZE=0
+declare -a ROWS=()
+declare -a VIEW=()
+SELECTED=0
+SCROLL=0
+FILTER=""
+SCANNED=0
+TOTAL="${#GIT_PATHS[@]}"
+BEHIND_N=0
+DIRTY_N=0
+DIVERGED_N=0
+AHEAD_N=0
+TICKER_BUF=""
+TICKER_OFFSET=0
+BREAKING=""
+
+_add_breaking() {
+  BREAKING="$BREAKING   $1"
+  # keep last ~200 chars
+  [[ "${#BREAKING}" -gt 200 ]] && BREAKING="${BREAKING: -200}"
+}
+
+_ticker_rebuild() {
+  local p="   🔴 LIVE  ·  REPO REPORTER  ·  scanned ${SCANNED}/${TOTAL}"
+  [[ "$BEHIND_N"   -gt 0 ]] && p+="  ·  ⚡ ${BEHIND_N} BEHIND"
+  [[ "$DIVERGED_N" -gt 0 ]] && p+="  ·  ⚡ ${DIVERGED_N} DIVERGED"
+  [[ "$AHEAD_N"    -gt 0 ]] && p+="  ·  ⚡ ${AHEAD_N} AHEAD"
+  [[ "$DIRTY_N"    -gt 0 ]] && p+="  ·  ⚠ ${DIRTY_N} DIRTY"
+  [[ -n "$BREAKING" ]]     && p+="  ·  $BREAKING"
+  p+="   ·   press ? for help, q to quit   ·   "
+  p+="                              "
+  TICKER_BUF="$p"
+}
+
+_draw_ticker() {
+  _ticker_rebuild
+  local len="${#TICKER_BUF}"
+  [[ "$len" -lt 1 ]] && return
+  local doubled="${TICKER_BUF}${TICKER_BUF}"
+  local off=$(( TICKER_OFFSET % len ))
+  local slice="${doubled:off:TERM_COLS}"
+  printf '\e[1;1H\e[2K\e[7m%s\e[0m' "$slice"
+}
+
+_draw_status() {
+  local fetch_str="off"; [[ "$FETCH" -eq 1 ]] && fetch_str="on"
+  printf '\e[2;1H\e[2K'
+  printf 'root:%s  jobs:%d  fetch:%s  scanned:%d/%d  behind:%d  ahead:%d  dirty:%d  diverged:%d  filter:%s' \
+    "$ROOT" "$JOBS" "$fetch_str" "$SCANNED" "$TOTAL" "$BEHIND_N" "$AHEAD_N" "$DIRTY_N" "$DIVERGED_N" "${FILTER:--}"
+}
+
+_draw_separator() {
+  printf '\e[%d;1H\e[2K' "$1"
+  local i
+  for ((i=0; i<TERM_COLS; i++)); do printf -- '-'; done
+}
+
+_rebuild_view() {
+  VIEW=()
+  local i line
+  for i in "${!ROWS[@]}"; do
+    line="${ROWS[$i]}"
+    if [[ -n "$FILTER" ]]; then
+      [[ "$line" == *"$FILTER"* ]] || continue
+    fi
+    VIEW+=("$i")
+  done
+  local max=$(( ${#VIEW[@]} - 1 ))
+  [[ "$max" -lt 0 ]] && max=0
+  [[ "$SELECTED" -gt "$max" ]] && SELECTED="$max"
+  [[ "$SELECTED" -lt 0 ]] && SELECTED=0
+}
+
+_draw_list() {
+  local top=4
+  local bottom=$(( TERM_ROWS - 2 ))
+  local visible=$(( bottom - top + 1 ))
+  [[ "$visible" -lt 1 ]] && return
+
+  if [[ "$SELECTED" -lt "$SCROLL" ]]; then SCROLL="$SELECTED"; fi
+  if [[ "$SELECTED" -ge $((SCROLL + visible)) ]]; then SCROLL=$((SELECTED - visible + 1)); fi
+  [[ "$SCROLL" -lt 0 ]] && SCROLL=0
+
+  local i screen_row idx line repo branch sha _date _ah _bh dirty status
+  local maxrepo=$(( TERM_COLS - 55 ))
+  [[ "$maxrepo" -lt 20 ]] && maxrepo=20
+
+  for ((i=0; i<visible; i++)); do
+    screen_row=$((top + i))
+    printf '\e[%d;1H\e[2K' "$screen_row"
+    idx=$((SCROLL + i))
+    [[ "$idx" -ge "${#VIEW[@]}" ]] && continue
+    line="${ROWS[${VIEW[$idx]}]}"
+    IFS=$'\t' read -r repo branch sha _date _ah _bh dirty status _ _ <<< "$line"
+
+    local marker="  "
+    [[ "$idx" -eq "$SELECTED" ]] && marker=$'\e[1;7m> \e[0m'
+
+    local color="\e[32m"
+    case "$status" in
+      up-to-date) color="\e[32m" ;;
+      behind)     color="\e[33m" ;;
+      ahead)      color="\e[36m" ;;
+      diverged)   color="\e[31m" ;;
+      dirty)      color="\e[31m" ;;
+      no-upstream)color="\e[90m" ;;
+    esac
+    local dirty_color="\e[32m"
+    [[ "$dirty" == "dirty" ]] && dirty_color="\e[31m"
+
+    local shortrepo="$repo"
+    if [[ "${#shortrepo}" -gt "$maxrepo" ]]; then
+      shortrepo="…${shortrepo: -$((maxrepo-1))}"
+    fi
+    printf '%b%-*s  %-14s  %-8s  %b%-11s\e[0m  %b%-5s\e[0m  +%s/-%s' \
+      "$marker" "$maxrepo" "$shortrepo" "$branch" "$sha" \
+      "$color" "$status" "$dirty_color" "$dirty" "$_ah" "$_bh"
+  done
+}
+
+_draw_help() {
+  local row=$(( TERM_ROWS - 1 ))
+  _draw_separator "$row"
+  row=$((row + 1))
+  printf '\e[%d;1H\e[2K\e[2m j/k move   / filter   f fetch+rescan   r rescan   q quit \e[0m' "$row"
+}
+
+_redraw_all() {
+  printf '\e[2J\e[H'
+  _query_size
+  _draw_ticker
+  _draw_status
+  _draw_separator 3
+  _draw_list
+  _draw_help
+}
+
+_start_scan() {
+  if [[ -n "$SCAN_PID" ]]; then
+    kill "$SCAN_PID" 2>/dev/null || true
+    wait "$SCAN_PID" 2>/dev/null || true
+    SCAN_PID=""
+  fi
+  exec 3<&- 2>/dev/null || true
+  [[ -n "$FIFO" && -e "$FIFO" ]] && rm -f "$FIFO"
+  FIFO=$(mktemp -u -t repo-report.fifo.XXXXXX) || err RR403 "mktemp -u failed" 1
+  mkfifo "$FIFO" 2>/dev/null || err RR403 "mkfifo failed: $FIFO" 1
+
+  mapfile -t GIT_PATHS < <(scan_paths)
+  TOTAL="${#GIT_PATHS[@]}"
+  ROWS=(); VIEW=(); SELECTED=0; SCROLL=0
+  SCANNED=0; BEHIND_N=0; DIRTY_N=0; DIVERGED_N=0; AHEAD_N=0
+  BREAKING=""
+
+  export REPO_REPORT_FETCH="$FETCH"
+  if [[ "$TOTAL" -gt 0 ]]; then
+    ( printf '%s\0' "${GIT_PATHS[@]}" \
+        | xargs -0 -n1 -P "$JOBS" bash -c '_report_one "$1"' bash > "$FIFO"
+    ) &
+    SCAN_PID=$!
+  fi
+  exec 3< "$FIFO"
+}
+
+_absorb_line() {
+  local line="$1"
+  [[ -z "$line" ]] && return
+  ROWS+=("$line")
+  SCANNED=$(( SCANNED + 1 ))
+  local repo _b _s _d _a _bh dirty status
+  IFS=$'\t' read -r repo _b _s _d _a _bh dirty status _ _ <<< "$line"
+  local short="${repo##*/}"
+  case "$status" in
+    behind)   ((BEHIND_N++));   _add_breaking "⚡ ${short} BEHIND" ;;
+    ahead)    ((AHEAD_N++));    _add_breaking "⚡ ${short} AHEAD" ;;
+    diverged) ((DIVERGED_N++)); _add_breaking "⚡ ${short} DIVERGED" ;;
+  esac
+  [[ "$dirty" == "dirty" ]] && { ((DIRTY_N++)); _add_breaking "⚠ ${short} DIRTY"; }
+}
+
+_drain_scan() {
+  local line got=0
+  while IFS= read -r -t 0.01 -u 3 line; do
+    _absorb_line "$line"
+    got=1
+    [[ "$got" -ge 50 ]] && break
+  done
+  [[ "$got" -eq 1 ]] && _rebuild_view
+}
+
+_prompt_filter() {
+  local row=$(( TERM_ROWS ))
+  printf '\e[%d;1H\e[2K/' "$row"
+  printf '\e[?25h'
+  stty sane 2>/dev/null
+  local input
+  IFS= read -r input
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '\e[?25l'
+  FILTER="$input"
+  _rebuild_view
+}
+
+_tui_main() {
+  _tui_setup
+  _start_scan
+  _redraw_all
+
+  local key seq2 seq3 tick=0
+  while true; do
+    _drain_scan
+    TICKER_OFFSET=$((TICKER_OFFSET + 1))
+    _draw_ticker
+    _draw_status
+    _draw_list
+
+    if [[ "$RESIZE" -eq 1 ]]; then
+      RESIZE=0
+      _redraw_all
+    fi
+
+    if read -rsn1 -t 0.1 key; then
+      case "$key" in
+        q|Q) break ;;
+        j)   SELECTED=$((SELECTED + 1)); _rebuild_view ;;
+        k)   SELECTED=$((SELECTED - 1)); _rebuild_view ;;
+        r)   _start_scan; _redraw_all ;;
+        f)   FETCH=$((1 - FETCH)); _start_scan; _redraw_all ;;
+        /)   _prompt_filter; _redraw_all ;;
+        $'\e')
+          # Could be an arrow key (ESC [ A/B/C/D)
+          read -rsn1 -t 0.005 seq2 || continue
+          read -rsn1 -t 0.005 seq3 || continue
+          if [[ "$seq2" == "[" ]]; then
+            case "$seq3" in
+              A) SELECTED=$((SELECTED - 1)); _rebuild_view ;;
+              B) SELECTED=$((SELECTED + 1)); _rebuild_view ;;
+            esac
+          fi
+          ;;
+      esac
+    fi
+    tick=$((tick + 1))
+  done
+
+  _tui_teardown
+
+  # Use the collected ROWS for final exit code
+  local tsv=""
+  if [[ "${#ROWS[@]}" -gt 0 ]]; then
+    tsv=$(printf '%s\n' "${ROWS[@]}")
+  fi
+  if final_exit_code "$tsv"; then exit 0; else exit 1; fi
+}
+
+_tui_main
