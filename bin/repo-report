@@ -168,8 +168,10 @@ _report_one() {
   else status="ahead"
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$repo" "$branch" "$sha" "$date" "$ahead" "$behind" "$dirty" "$status" "$remote" "$msg"
+  stash=$(git -C "$repo" stash list 2>/dev/null | wc -l | tr -d ' ')
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$repo" "$branch" "$sha" "$date" "$ahead" "$behind" "$dirty" "$status" "$remote" "$msg" "$stash"
 }
 export -f _report_one
 export REPO_REPORT_FETCH="$FETCH"
@@ -184,19 +186,19 @@ run_scan_sync() {
 # Non-interactive emitters
 # ------------------------------------------------------------------
 emit_tsv() {
-  printf 'repo\tbranch\tsha\tdate\tahead\tbehind\tdirty\tstatus\tremote\tmessage\n'
+  printf 'repo\tbranch\tsha\tdate\tahead\tbehind\tdirty\tstatus\tremote\tmessage\tstash\n'
   printf '%s\n' "$1"
 }
 
 emit_table() {
   local w="$MSG_WIDTH"
   {
-    printf 'REPO\tBRANCH\tSHA\tDATE\tA\tB\tDIRTY\tSTATUS\tMESSAGE\n'
+    printf 'REPO\tBRANCH\tSHA\tDATE\tA\tB\tDIRTY\tSTATUS\tMESSAGE\tSTASH\n'
     printf '%s\n' "$1" \
       | awk -F'\t' -v W="$w" 'BEGIN{OFS="\t"}
           { m=$10; if (length(m) > W) m=substr(m,1,W-1) "…";
             d=$4; if (length(d) >= 10) d=substr(d,1,10);
-            print $1,$2,$3,d,$5,$6,$7,$8,m }'
+            print $1,$2,$3,d,$5,$6,$7,$8,m,$11+0 }'
   } | { command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat; }
 }
 
@@ -214,8 +216,8 @@ emit_json() {
     NF==0 { next }
     {
       if (!first) printf ",\n"; first=0
-      printf "  {\"repo\":\"%s\",\"branch\":\"%s\",\"sha\":\"%s\",\"date\":\"%s\",\"ahead\":%d,\"behind\":%d,\"dirty\":\"%s\",\"status\":\"%s\",\"remote\":\"%s\",\"message\":\"%s\"}",
-        esc($1), esc($2), esc($3), esc($4), $5+0, $6+0, esc($7), esc($8), esc($9), esc($10)
+      printf "  {\"repo\":\"%s\",\"branch\":\"%s\",\"sha\":\"%s\",\"date\":\"%s\",\"ahead\":%d,\"behind\":%d,\"dirty\":\"%s\",\"status\":\"%s\",\"remote\":\"%s\",\"message\":\"%s\",\"stash\":%d}",
+        esc($1), esc($2), esc($3), esc($4), $5+0, $6+0, esc($7), esc($8), esc($9), esc($10), $11+0
     }
     END{ if (!first) printf "\n"; print "]" }
   '
@@ -312,6 +314,19 @@ AHEAD_N=0
 TICKER_BUF=""
 TICKER_OFFSET=0
 BREAKING=""
+SORT_MODE="path"
+declare -a SORT_MODES=("path" "status" "date" "branch" "ahead-desc" "behind-desc")
+SORT_IDX=0
+FILTER_MODE=0
+FILTER_SAVED=""
+FILTER_INPUT=""
+SHOW_HEADER=0
+IS_REPO_WS=0
+[[ -d "${ROOT}/.repo" ]] && IS_REPO_WS=1
+REPO_MANIFEST_BRANCH=""
+if [[ "$IS_REPO_WS" -eq 1 ]]; then
+  REPO_MANIFEST_BRANCH=$(repo info -l 2>/dev/null | awk '/Manifest branch/{print $NF}' || echo "")
+fi
 
 _add_breaking() {
   BREAKING="$BREAKING   $1"
@@ -344,14 +359,26 @@ _draw_ticker() {
 _draw_status() {
   local fetch_str="off"; [[ "$FETCH" -eq 1 ]] && fetch_str="on"
   printf '\e[2;1H\e[2K'
-  printf 'root:%s  jobs:%d  fetch:%s  scanned:%d/%d  behind:%d  ahead:%d  dirty:%d  diverged:%d  filter:%s' \
-    "$ROOT" "$JOBS" "$fetch_str" "$SCANNED" "$TOTAL" "$BEHIND_N" "$AHEAD_N" "$DIRTY_N" "$DIVERGED_N" "${FILTER:--}"
+  local status_line
+  status_line=$(printf 'root:%s  jobs:%d  fetch:%s  sort:%s  scanned:%d/%d  behind:%d  ahead:%d  dirty:%d  diverged:%d  filter:%s' \
+    "$ROOT" "$JOBS" "$fetch_str" "$SORT_MODE" "$SCANNED" "$TOTAL" "$BEHIND_N" "$AHEAD_N" "$DIRTY_N" "$DIVERGED_N" "${FILTER:--}")
+  if [[ "$IS_REPO_WS" -eq 1 ]]; then
+    status_line+="  repo:${REPO_MANIFEST_BRANCH:-?}"
+  fi
+  printf '%s' "$status_line"
 }
 
 _draw_separator() {
   printf '\e[%d;1H\e[2K' "$1"
   local i
-  for ((i=0; i<TERM_COLS; i++)); do printf -- '-'; done
+  if [[ "$1" -eq 3 && "$SCANNED" -lt "$TOTAL" && "$TOTAL" -gt 0 ]]; then
+    local fill=$(( TERM_COLS * SCANNED / TOTAL ))
+    for ((i=0; i<TERM_COLS; i++)); do
+      [[ "$i" -lt "$fill" ]] && printf '\e[32m▓\e[0m' || printf -- '-'
+    done
+  else
+    for ((i=0; i<TERM_COLS; i++)); do printf -- '-'; done
+  fi
 }
 
 _rebuild_view() {
@@ -364,14 +391,48 @@ _rebuild_view() {
     fi
     VIEW+=("$i")
   done
+  _sort_view
   local max=$(( ${#VIEW[@]} - 1 ))
   [[ "$max" -lt 0 ]] && max=0
   [[ "$SELECTED" -gt "$max" ]] && SELECTED="$max"
   [[ "$SELECTED" -lt 0 ]] && SELECTED=0
 }
 
+_sort_view() {
+  [[ "$SORT_MODE" == "path" ]] && return
+  [[ "${#VIEW[@]}" -eq 0 ]] && return
+  local -a pairs=()
+  local i idx repo branch sha date ah bh dirty status rank
+  for i in "${!VIEW[@]}"; do
+    idx="${VIEW[$i]}"
+    IFS=$'\t' read -r repo branch sha date ah bh dirty status _ _ _ <<< "${ROWS[$idx]}"
+    case "$SORT_MODE" in
+      status)
+        case "$status" in
+          diverged)    rank=0 ;;
+          behind)      rank=1 ;;
+          ahead)       rank=2 ;;
+          no-upstream) rank=4 ;;
+          up-to-date)  rank=5 ;;
+          *)           rank=3 ;;
+        esac
+        [[ "$dirty" == "dirty" && "$rank" -gt 3 ]] && rank=3
+        pairs+=("${rank}:${i}") ;;
+      date)        pairs+=("${date}:${i}") ;;
+      branch)      pairs+=("${branch}:${i}") ;;
+      ahead-desc)  pairs+=("$(printf '%05d' $(( 99999 - ah ))):${i}") ;;
+      behind-desc) pairs+=("$(printf '%05d' $(( 99999 - bh ))):${i}") ;;
+    esac
+  done
+  local -a orig_view=("${VIEW[@]}")
+  VIEW=()
+  while IFS=: read -r _ j; do
+    VIEW+=("${orig_view[$j]}")
+  done < <(printf '%s\n' "${pairs[@]}" | sort)
+}
+
 _draw_list() {
-  local top=4
+  local top=$(( 4 + SHOW_HEADER ))
   local bottom=$(( TERM_ROWS - 2 ))
   local visible=$(( bottom - top + 1 ))
   [[ "$visible" -lt 1 ]] && return
@@ -380,9 +441,14 @@ _draw_list() {
   if [[ "$SELECTED" -ge $((SCROLL + visible)) ]]; then SCROLL=$((SELECTED - visible + 1)); fi
   [[ "$SCROLL" -lt 0 ]] && SCROLL=0
 
-  local i screen_row idx line repo branch sha _date _ah _bh dirty status
+  local i screen_row idx line repo branch sha _date _ah _bh dirty status _stash
   local maxrepo=$(( TERM_COLS - 55 ))
   [[ "$maxrepo" -lt 20 ]] && maxrepo=20
+
+  if [[ "$SHOW_HEADER" -eq 1 ]]; then
+    printf '\e[4;1H\e[2K\e[2m  %-*s  %-14s  %-8s  %-11s  %-5s  +A/-B\e[0m' \
+      "$maxrepo" "REPO" "BRANCH" "SHA" "STATUS" "DIRTY"
+  fi
 
   for ((i=0; i<visible; i++)); do
     screen_row=$((top + i))
@@ -390,7 +456,7 @@ _draw_list() {
     idx=$((SCROLL + i))
     [[ "$idx" -ge "${#VIEW[@]}" ]] && continue
     line="${ROWS[${VIEW[$idx]}]}"
-    IFS=$'\t' read -r repo branch sha _date _ah _bh dirty status _ _ <<< "$line"
+    IFS=$'\t' read -r repo branch sha _date _ah _bh dirty status _ _ _stash <<< "$line"
 
     local marker="  "
     [[ "$idx" -eq "$SELECTED" ]] && marker=$'\e[1;7m> \e[0m'
@@ -414,6 +480,9 @@ _draw_list() {
     printf '%b%-*s  %-14s  %-8s  %b%-11s\e[0m  %b%-5s\e[0m  +%s/-%s' \
       "$marker" "$maxrepo" "$shortrepo" "$branch" "$sha" \
       "$color" "$status" "$dirty_color" "$dirty" "$_ah" "$_bh"
+    if [[ "${_stash:-0}" -gt 0 ]]; then
+      printf ' \e[33ms:%s\e[0m' "$_stash"
+    fi
   done
 }
 
@@ -421,7 +490,11 @@ _draw_help() {
   local row=$(( TERM_ROWS - 1 ))
   _draw_separator "$row"
   row=$((row + 1))
-  printf '\e[%d;1H\e[2K\e[2m j/k move   / filter   f fetch+rescan   r rescan   q quit \e[0m' "$row"
+  if [[ "$FILTER_MODE" -eq 1 ]]; then
+    printf '\e[%d;1H\e[2K\e[2mfilter:\e[0m %s\e[2m█  (Enter=confirm  Esc=cancel)\e[0m' "$row" "$FILTER_INPUT"
+  else
+    printf '\e[%d;1H\e[2K\e[2m j/k/g/G move   PgUp/PgDn page   / filter   s sort   f fetch   r rescan   ? help   q quit \e[0m' "$row"
+  fi
 }
 
 _redraw_all() {
@@ -466,8 +539,8 @@ _absorb_line() {
   [[ -z "$line" ]] && return
   ROWS+=("$line")
   SCANNED=$(( SCANNED + 1 ))
-  local repo _b _s _d _a _bh dirty status
-  IFS=$'\t' read -r repo _b _s _d _a _bh dirty status _ _ <<< "$line"
+  local repo _b _s _d _a _bh dirty status _stash
+  IFS=$'\t' read -r repo _b _s _d _a _bh dirty status _ _ _stash <<< "$line"
   local short="${repo##*/}"
   case "$status" in
     behind)   ((BEHIND_N++));   _add_breaking "⚡ ${short} BEHIND" ;;
@@ -487,17 +560,199 @@ _drain_scan() {
   [[ "$got" -eq 1 ]] && _rebuild_view
 }
 
-_prompt_filter() {
-  local row=$(( TERM_ROWS ))
-  printf '\e[%d;1H\e[2K/' "$row"
+_prompt_export() {
+  local default_file="/tmp/repo-report-$(date +%Y%m%d).tsv"
+  local row="$TERM_ROWS"
+  printf '\e[%d;1H\e[2K' "$row"
   printf '\e[?25h'
-  stty sane 2>/dev/null
+  stty sane 2>/dev/null || true
+  printf 'export to [%s]: ' "$default_file"
   local input
   IFS= read -r input
   stty -echo -icanon time 0 min 0 2>/dev/null || true
   printf '\e[?25l'
-  FILTER="$input"
-  _rebuild_view
+  [[ -z "$input" ]] && input="$default_file"
+  local tsv_data=""
+  local i
+  for i in "${VIEW[@]}"; do
+    tsv_data+="${ROWS[$i]}"$'\n'
+  done
+  tsv_data="${tsv_data%$'\n'}"
+  local fmt="tsv"
+  [[ "$input" == *.json ]] && fmt="json"
+  if [[ "$fmt" == "json" ]]; then
+    emit_json "$tsv_data" > "$input" 2>/dev/null \
+      && _add_breaking "✓ exported ${#VIEW[@]} repos → $input" \
+      || _add_breaking "✗ export failed: $input"
+  else
+    { printf 'repo\tbranch\tsha\tdate\tahead\tbehind\tdirty\tstatus\tremote\tmessage\tstash\n'
+      printf '%s\n' "$tsv_data"
+    } > "$input" 2>/dev/null \
+      && _add_breaking "✓ exported ${#VIEW[@]} repos → $input" \
+      || _add_breaking "✗ export failed: $input"
+  fi
+  _redraw_all
+}
+
+_draw_help_overlay() {
+  local box_w=46 box_h=31
+  local col=$(( (TERM_COLS - box_w) / 2 ))
+  local row=$(( (TERM_ROWS - box_h) / 2 ))
+  [[ "$col" -lt 1 ]] && col=1
+  [[ "$row" -lt 1 ]] && row=1
+  local i
+  printf '\e[%d;%dH' "$row" "$col"
+  printf '\e[7m╭'; for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╮\e[0m'
+  local -a lines=(
+    "  REPO-REPORT  KEY BINDINGS             "
+    "                                        "
+    "  j / ↓       move down                 "
+    "  k / ↑       move up                   "
+    "  g / G       jump top / bottom         "
+    "  PgDn/PgUp   page scroll               "
+    "  /           filter (live, Esc=cancel) "
+    "  Esc         clear filter              "
+    "  Enter       open detail pane          "
+    "  s           cycle sort mode           "
+    "  f           toggle fetch + rescan     "
+    "  F           repo sync  (AOSP only)    "
+    "  r           rescan                    "
+    "  T           repo status  (AOSP only)  "
+    "  e           export current view       "
+    "  c           toggle column header      "
+    "  ?           this help                 "
+    "  q           quit                      "
+    "                                        "
+    "  Colours                               "
+    "  green    = up-to-date                 "
+    "  yellow   = behind                     "
+    "  cyan     = ahead                      "
+    "  red      = diverged                   "
+    "  grey     = no-upstream                "
+    "  yellow s:N = stash count              "
+    "                                        "
+    "        press any key to dismiss        "
+  )
+  local r=$(( row + 1 ))
+  for l in "${lines[@]}"; do
+    printf '\e[%d;%dH\e[7m│\e[0m%-*s\e[7m│\e[0m' "$r" "$col" "$(( box_w - 2 ))" "$l"
+    (( r++ ))
+  done
+  printf '\e[%d;%dH\e[7m╰' "$r" "$col"
+  for ((i=0;i<box_w-2;i++)); do printf '─'; done
+  printf '╯\e[0m'
+  read -rsn1 -t 30 _ || true
+  _redraw_all
+}
+
+_open_detail() {
+  [[ "${#VIEW[@]}" -eq 0 ]] && return
+  local idx="${VIEW[$SELECTED]}"
+  local line="${ROWS[$idx]}"
+  local repo branch sha date ah bh dirty status remote msg stash
+  IFS=$'\t' read -r repo branch sha date ah bh dirty status remote msg stash <<< "$line"
+  local log5 stash_n
+  log5=$(git -C "$repo" log -5 --oneline 2>/dev/null || echo "(no log)")
+  stash_n=$(git -C "$repo" stash list 2>/dev/null | wc -l | tr -d ' ')
+  local box_w=$(( TERM_COLS - 4 ))
+  [[ "$box_w" -gt 80 ]] && box_w=80
+  local box_h=20
+  local col=$(( (TERM_COLS - box_w) / 2 ))
+  local row=$(( (TERM_ROWS - box_h) / 2 ))
+  [[ "$col" -lt 1 ]] && col=1
+  [[ "$row" -lt 1 ]] && row=1
+  local i
+  printf '\e[%d;%dH' "$row" "$col"
+  printf '\e[7m╭'; for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╮\e[0m'
+  local inner=$(( box_w - 4 ))
+  local -a dlines=(
+    "$(printf '%-*s' "$inner" " DETAIL: ${repo##*/}")"
+    "$(printf '%-*s' "$inner" "")"
+    "$(printf '%-*s' "$inner" " repo:    $repo")"
+    "$(printf '%-*s' "$inner" " branch:  $branch")"
+    "$(printf '%-*s' "$inner" " sha:     $sha")"
+    "$(printf '%-*s' "$inner" " date:    $date")"
+    "$(printf '%-*s' "$inner" " status:  $status")"
+    "$(printf '%-*s' "$inner" " dirty:   $dirty")"
+    "$(printf '%-*s' "$inner" " ahead:   $ah  behind: $bh")"
+    "$(printf '%-*s' "$inner" " stash:   $stash_n")"
+    "$(printf '%-*s' "$inner" " remote:  ${remote:0:$inner}")"
+    "$(printf '%-*s' "$inner" " message: ${msg:0:$inner}")"
+    "$(printf '%-*s' "$inner" "")"
+    "$(printf '%-*s' "$inner" " recent commits:")"
+  )
+  while IFS= read -r logline; do
+    dlines+=("$(printf '%-*s' "$inner" "   ${logline:0:$inner}")")
+  done <<< "$log5"
+  while [[ "${#dlines[@]}" -lt $(( box_h - 2 )) ]]; do
+    dlines+=("$(printf '%-*s' "$inner" "")")
+  done
+  local r=$(( row + 1 ))
+  for l in "${dlines[@]}"; do
+    [[ "$r" -ge $(( row + box_h - 1 )) ]] && break
+    printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "$l"
+    (( r++ ))
+  done
+  printf '\e[%d;%dH\e[7m│\e[0m%-*s\e[7m│\e[0m' "$r" "$col" "$(( box_w - 2 ))" "$(printf '%*s' "$(( box_w - 2 ))" ' press any key to close ')"
+  (( r++ ))
+  printf '\e[%d;%dH\e[7m╰' "$r" "$col"
+  for ((i=0;i<box_w-2;i++)); do printf '─'; done
+  printf '╯\e[0m'
+  read -rsn1 -t 60 _ || true
+  _redraw_all
+}
+
+_run_repo_sync() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  _add_breaking "⟳ repo sync starting..."
+  ( repo sync -j"$JOBS" -q 2>&1 ) &
+  local rpid=$!
+  wait "$rpid" 2>/dev/null || true
+  _add_breaking "✓ repo sync done"
+  _start_scan
+  _redraw_all
+}
+
+_draw_repo_status_overlay() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  local -a lines=()
+  while IFS= read -r l; do lines+=("$l"); done < <(repo status 2>&1)
+  local box_w=$(( TERM_COLS - 4 ))
+  [[ "$box_w" -gt 100 ]] && box_w=100
+  local max_lines=$(( TERM_ROWS - 6 ))
+  local box_h=$(( ${#lines[@]} + 4 ))
+  [[ "$box_h" -gt "$max_lines" ]] && box_h="$max_lines"
+  local col=$(( (TERM_COLS - box_w) / 2 ))
+  local row=$(( (TERM_ROWS - box_h) / 2 ))
+  [[ "$col" -lt 1 ]] && col=1
+  [[ "$row" -lt 1 ]] && row=1
+  local i
+  printf '\e[%d;%dH' "$row" "$col"
+  printf '\e[7m╭'; for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╮\e[0m'
+  local inner=$(( box_w - 4 ))
+  local r=$(( row + 1 ))
+  printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "repo status"
+  (( r++ ))
+  printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+  (( r++ ))
+  for l in "${lines[@]}"; do
+    [[ "$r" -ge $(( row + box_h - 2 )) ]] && break
+    printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "${l:0:$inner}"
+    (( r++ ))
+  done
+  while [[ "$r" -lt $(( row + box_h - 2 )) ]]; do
+    printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+    (( r++ ))
+  done
+  printf '\e[%d;%dH\e[7m│\e[0m%-*s\e[7m│\e[0m' "$r" "$col" "$(( box_w - 2 ))" "$(printf '%*s' "$(( box_w - 2 ))" ' press any key to close ')"
+  (( r++ ))
+  printf '\e[%d;%dH\e[7m╰' "$r" "$col"
+  for ((i=0;i<box_w-2;i++)); do printf '─'; done
+  printf '╯\e[0m'
+  read -rsn1 -t 60 _ || true
+  _redraw_all
 }
 
 _tui_main() {
@@ -519,25 +774,67 @@ _tui_main() {
     fi
 
     if read -rsn1 -t 0.1 key; then
-      case "$key" in
-        q|Q) break ;;
-        j)   SELECTED=$((SELECTED + 1)); _rebuild_view ;;
-        k)   SELECTED=$((SELECTED - 1)); _rebuild_view ;;
-        r)   _start_scan; _redraw_all ;;
-        f)   FETCH=$((1 - FETCH)); _start_scan; _redraw_all ;;
-        /)   _prompt_filter; _redraw_all ;;
-        $'\e')
-          # Could be an arrow key (ESC [ A/B/C/D)
-          read -rsn1 -t 0.005 seq2 || continue
-          read -rsn1 -t 0.005 seq3 || continue
-          if [[ "$seq2" == "[" ]]; then
-            case "$seq3" in
-              A) SELECTED=$((SELECTED - 1)); _rebuild_view ;;
-              B) SELECTED=$((SELECTED + 1)); _rebuild_view ;;
-            esac
-          fi
-          ;;
-      esac
+      if [[ "$FILTER_MODE" -eq 1 ]]; then
+        case "$key" in
+          $'\n')
+            FILTER="$FILTER_INPUT"; FILTER_MODE=0; _redraw_all ;;
+          $'\e')
+            read -rsn1 -t 0.005 seq2 || {
+              FILTER="$FILTER_SAVED"; FILTER_INPUT="$FILTER_SAVED"
+              FILTER_MODE=0; _rebuild_view; _draw_help; continue
+            }
+            read -rsn1 -t 0.005 seq3 || true
+            ;;
+          $'\x7f'|$'\b')
+            FILTER_INPUT="${FILTER_INPUT%?}"
+            FILTER="$FILTER_INPUT"
+            _rebuild_view; _draw_help ;;
+          *)
+            FILTER_INPUT+="$key"
+            FILTER="$FILTER_INPUT"
+            _rebuild_view; _draw_help ;;
+        esac
+      else
+        case "$key" in
+          q|Q) break ;;
+          j)   SELECTED=$((SELECTED + 1)); _rebuild_view ;;
+          k)   SELECTED=$((SELECTED - 1)); _rebuild_view ;;
+          g)   SELECTED=0; _rebuild_view ;;
+          G)   SELECTED=$(( ${#VIEW[@]} - 1 )); [[ "$SELECTED" -lt 0 ]] && SELECTED=0; _rebuild_view ;;
+          r)   _start_scan; _redraw_all ;;
+          f)   FETCH=$((1 - FETCH)); _start_scan; _redraw_all ;;
+          s)   SORT_IDX=$(( (SORT_IDX + 1) % ${#SORT_MODES[@]} ))
+               SORT_MODE="${SORT_MODES[$SORT_IDX]}"
+               _rebuild_view ;;
+          c)   SHOW_HEADER=$(( 1 - SHOW_HEADER )); _redraw_all ;;
+          e)   _prompt_export ;;
+          '?') _draw_help_overlay ;;
+          $'\n') _open_detail ;;
+          /)
+            FILTER_SAVED="$FILTER"
+            FILTER_INPUT="$FILTER"
+            FILTER_MODE=1
+            _draw_help ;;
+          F) _run_repo_sync ;;
+          T) _draw_repo_status_overlay ;;
+          $'\e')
+            read -rsn1 -t 0.005 seq2 || { FILTER=""; _rebuild_view; continue; }
+            read -rsn1 -t 0.005 seq3 || continue
+            if [[ "$seq2" == "[" ]]; then
+              case "$seq3" in
+                A) SELECTED=$((SELECTED - 1)); _rebuild_view ;;
+                B) SELECTED=$((SELECTED + 1)); _rebuild_view ;;
+                5) read -rsn1 -t 0.005 _ || true
+                   local pg=$(( TERM_ROWS - 6 )); [[ "$pg" -lt 1 ]] && pg=1
+                   SELECTED=$(( SELECTED - pg )); _rebuild_view ;;
+                6) read -rsn1 -t 0.005 _ || true
+                   local pg=$(( TERM_ROWS - 6 )); [[ "$pg" -lt 1 ]] && pg=1
+                   SELECTED=$(( SELECTED + pg )); _rebuild_view ;;
+              esac
+            fi
+            ;;
+        esac
+      fi
     fi
     tick=$((tick + 1))
   done
