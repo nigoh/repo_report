@@ -1,5 +1,7 @@
 # repo_report
 
+[日本語版 README はこちら](README.ja.md)
+
 `repo-report` is a single-file Bash CLI that walks a directory tree, finds
 every nested git repository (both `.git` directories and `.git` gitfile
 pointers — as used by Google's `repo` tool and submodules) and shows their
