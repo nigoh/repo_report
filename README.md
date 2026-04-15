@@ -2,6 +2,8 @@
 
 [日本語版 README はこちら](README.ja.md)
 
+![repo-report demo](demo.gif)
+
 `repo-report` is a single-file Bash CLI that walks a directory tree, finds
 every nested git repository (both `.git` directories and `.git` gitfile
 pointers — as used by Google's `repo` tool and submodules) and shows their
@@ -191,6 +193,49 @@ sub-`PIPE_BUF` line, so concurrent writes to stdout stay atomic on Linux.
 
 Tune with `-j N`. For I/O-bound `--fetch` runs, setting `-j` well above
 `nproc` (e.g. `-j 64`) is usually faster.
+
+### Scenarios
+
+Place a `.repo-report.yml` file in the scan root to define **scenarios** — shell
+commands that run automatically when events occur (sync complete, scan done, etc.)
+or manually from within the TUI.
+
+```yaml
+scenarios:
+  - name: "Build after sync"
+    on: sync_done
+    run: make -j8 build
+
+  - name: "Alert on dirty repos"
+    on: scan_done
+    if: dirty_count > 0
+    run: notify-send "Dirty repos found: $dirty_count"
+
+  - name: "Full rebuild"
+    on: manual
+    run: make -j8 all
+```
+
+**Triggers** (`on:`):
+
+| trigger | fired when |
+| ------- | ---------- |
+| `sync_done` | `repo sync` or `repo sync -n` completes (`F`/`n` keys) |
+| `scan_done` | initial repo scan finishes |
+| `manual` | user explicitly runs from scenario menu (`X` key) |
+
+**Condition** (`if:`, optional) — evaluated before running; available variables:
+`dirty_count`, `behind_count`, `ahead_count`, `diverged_count`, `total_count`.
+
+**TUI keys for scenarios:**
+
+| key | action |
+| --- | ------ |
+| `X` | open scenario selection menu |
+| `L` | view output of last scenario run |
+
+Results are announced in the ticker as `✓ NAME OK` or `✗ NAME FAILED`, and the
+full stdout+stderr is accessible via `L`.
 
 ### Error codes
 

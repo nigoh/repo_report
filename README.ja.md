@@ -1,5 +1,7 @@
 # repo_report
 
+![repo-report demo](demo.gif)
+
 `repo-report` は単一ファイルの Bash CLI です。ディレクトリツリーを走査し、ネストされたすべての git リポジトリ（`.git` ディレクトリおよび `.git` gitfile ポインタ — Google の `repo` ツールやサブモジュールで使用される形式）を検出してそのステータスを表示します。2 つのモードがあります：
 
 - **インタラクティブ TUI**（実端末上でのデフォルト）— アニメーション付きの `🔴 LIVE · REPO REPORTER` ニュースティッカーが上部をスクロールしながら、ワーカーがスクロール・フィルタ・ソート可能なリストに結果を流し込みます。`?` キーで全キーバインドを確認できます。
@@ -170,6 +172,48 @@ repo-report --fetch -n . >/dev/null || echo "workspace not clean"
 `repo-report` はデフォルトで `nproc` ワーカーを使用し、`xargs -P` で並列化します。NUL 区切り入力を使用するため、特殊なパスも正しく処理されます。各ワーカーは単一の `PIPE_BUF` 以下の行を出力するため、Linux 上では stdout への同時書き込みがアトミックに保たれます。
 
 `-j N` で調整できます。I/O バウンドな `--fetch` 実行では、`nproc` より大幅に高い `-j`（例：`-j 64`）を設定するとより高速になります。
+
+### シナリオ
+
+スキャンルートに `.repo-report.yml` を置くことで **シナリオ** を定義できます。
+シナリオとは、特定のイベント（sync 完了・スキャン完了など）が発生したとき、または TUI から手動で起動したときに実行されるシェルコマンドです。
+
+```yaml
+scenarios:
+  - name: "Build after sync"
+    on: sync_done
+    run: make -j8 build
+
+  - name: "Alert on dirty repos"
+    on: scan_done
+    if: dirty_count > 0
+    run: notify-send "Dirty repos found: $dirty_count"
+
+  - name: "Full rebuild"
+    on: manual
+    run: make -j8 all
+```
+
+**トリガー** (`on:`):
+
+| トリガー | 発火タイミング |
+| -------- | -------------- |
+| `sync_done` | `repo sync` または `repo sync -n` の完了後（`F`/`n` キー） |
+| `scan_done` | 初回リポジトリスキャン完了後 |
+| `manual` | シナリオメニューからユーザーが手動実行（`X` キー） |
+
+**条件** (`if:`, 省略可) — 実行前に評価されます。利用可能な変数：
+`dirty_count`、`behind_count`、`ahead_count`、`diverged_count`、`total_count`。
+
+**TUI キー（シナリオ関連）:**
+
+| キー | 動作 |
+| ---- | ---- |
+| `X` | シナリオ選択メニューを開く |
+| `L` | 直前のシナリオ実行の出力を表示 |
+
+結果はティッカーに `✓ NAME OK` または `✗ NAME FAILED` として表示され、
+`L` キーで stdout+stderr の全文を確認できます。
 
 ### エラーコード
 

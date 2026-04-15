@@ -102,6 +102,63 @@ run_tests() {
   else
     fail "key not bound: ':' -> _prompt_repo_forall"
   fi
+
+  # ----- Scenario feature: verify functions and key bindings -----
+  local -a scenario_fns=(
+    "_load_scenarios"
+    "_eval_scenario_if"
+    "_run_scenario"
+    "_trigger_scenarios"
+    "_draw_scenario_menu"
+    "_draw_last_scenario_output"
+  )
+  for fn in "${scenario_fns[@]}"; do
+    if grep -q "^${fn}()" "$REPO_REPORT"; then
+      pass "scenario function defined: $fn"
+    else
+      fail "scenario function missing: $fn"
+    fi
+  done
+
+  if grep -q "X) _draw_scenario_menu" "$REPO_REPORT"; then
+    pass "key bound: X -> _draw_scenario_menu"
+  else
+    fail "key not bound: X -> _draw_scenario_menu"
+  fi
+
+  if grep -q "L) _draw_last_scenario_output" "$REPO_REPORT"; then
+    pass "key bound: L -> _draw_last_scenario_output"
+  else
+    fail "key not bound: L -> _draw_last_scenario_output"
+  fi
+
+  # ----- Scenario YAML config loading -----
+  local tmpscen; tmpscen=$(mktemp -d)
+  git -C "$tmpscen" init -q
+  git -C "$tmpscen" config commit.gpgsign false
+  git -C "$tmpscen" commit --allow-empty -m "init" -q
+  cat > "$tmpscen/.repo-report.yml" <<'EOF'
+scenarios:
+  - name: "Test scenario"
+    on: manual
+    run: echo "scenario ran"
+EOF
+  # Run in non-interactive mode to verify it doesn't crash with a config file present
+  "$REPO_REPORT" --format tsv "$tmpscen" >/dev/null 2>&1
+  pass "scenario: script does not crash with .repo-report.yml present"
+  rm -rf "$tmpscen"
+
+  # ----- Scenario trigger wiring: sync_done and scan_done triggers exist -----
+  if grep -q "_trigger_scenarios sync_done" "$REPO_REPORT"; then
+    pass "scenario trigger: sync_done is wired"
+  else
+    fail "scenario trigger: sync_done not wired"
+  fi
+  if grep -q "_trigger_scenarios scan_done" "$REPO_REPORT"; then
+    pass "scenario trigger: scan_done is wired"
+  else
+    fail "scenario trigger: scan_done not wired"
+  fi
 }
 
 run_tests

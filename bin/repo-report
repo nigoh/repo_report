@@ -328,6 +328,167 @@ if [[ "$IS_REPO_WS" -eq 1 ]]; then
   REPO_MANIFEST_BRANCH=$(repo info -l 2>/dev/null | awk '/Manifest branch/{print $NF}' || echo "")
 fi
 
+declare -ga SCENARIO_NAMES=()
+declare -ga SCENARIO_ONS=()
+declare -ga SCENARIO_IFS=()
+declare -ga SCENARIO_RUNS=()
+SCENARIO_LAST_NAME=""
+SCENARIO_LAST_OUTPUT=""
+SCENARIO_LAST_STATUS=0
+SCAN_DONE_TRIGGERED=0
+
+_load_scenarios() {
+  local cfg="${ROOT}/.repo-report.yml"
+  [[ -f "$cfg" ]] || return 0
+  SCENARIO_NAMES=(); SCENARIO_ONS=(); SCENARIO_IFS=(); SCENARIO_RUNS=()
+  local name="" on_val="" cond="" run_val="" line raw
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="${raw#"${raw%%[![:space:]]*}"}"
+    case "$line" in
+      "- name:"*)
+        if [[ -n "$name" && -n "$on_val" && -n "$run_val" ]]; then
+          SCENARIO_NAMES+=("$name"); SCENARIO_ONS+=("$on_val")
+          SCENARIO_IFS+=("$cond");   SCENARIO_RUNS+=("$run_val")
+        fi
+        name="${line#*name: }"; name="${name#\"}"; name="${name%\"}"
+        on_val=""; cond=""; run_val="" ;;
+      "on:"*)  on_val="${line#on: }" ;;
+      "if:"*)  cond="${line#if: }" ;;
+      "run:"*) run_val="${line#run: }"; run_val="${run_val#\"}"; run_val="${run_val%\"}" ;;
+    esac
+  done < "$cfg"
+  if [[ -n "$name" && -n "$on_val" && -n "$run_val" ]]; then
+    SCENARIO_NAMES+=("$name"); SCENARIO_ONS+=("$on_val")
+    SCENARIO_IFS+=("$cond");   SCENARIO_RUNS+=("$run_val")
+  fi
+}
+
+_eval_scenario_if() {
+  local cond="$1"
+  [[ -z "$cond" ]] && return 0
+  local expr="$cond"
+  expr="${expr//dirty_count/$DIRTY_N}"
+  expr="${expr//behind_count/$BEHIND_N}"
+  expr="${expr//ahead_count/$AHEAD_N}"
+  expr="${expr//diverged_count/$DIVERGED_N}"
+  expr="${expr//total_count/$TOTAL}"
+  if [[ "$expr" =~ ^([0-9]+)[[:space:]]*(==|!=|[><]=?)[[:space:]]*([0-9]+)$ ]]; then
+    local lhs="${BASH_REMATCH[1]}" op="${BASH_REMATCH[2]}" rhs="${BASH_REMATCH[3]}"
+    case "$op" in
+      "==") [[ "$lhs" -eq "$rhs" ]] ;;
+      "!=") [[ "$lhs" -ne "$rhs" ]] ;;
+      ">")  [[ "$lhs" -gt "$rhs" ]] ;;
+      "<")  [[ "$lhs" -lt "$rhs" ]] ;;
+      ">=") [[ "$lhs" -ge "$rhs" ]] ;;
+      "<=") [[ "$lhs" -le "$rhs" ]] ;;
+      *)    return 1 ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+_run_scenario() {
+  local idx="$1"
+  local name="${SCENARIO_NAMES[$idx]:-}"
+  local cond="${SCENARIO_IFS[$idx]:-}"
+  local cmd="${SCENARIO_RUNS[$idx]:-}"
+  [[ -z "$cmd" ]] && return
+  if ! _eval_scenario_if "$cond"; then
+    _add_breaking "⏭ $name skipped"
+    return
+  fi
+  _add_breaking "⟳ $name..."
+  SCENARIO_LAST_NAME="$name"
+  local out
+  out=$(bash -c "$cmd" 2>&1)
+  SCENARIO_LAST_STATUS=$?
+  SCENARIO_LAST_OUTPUT="$out"
+  if [[ "$SCENARIO_LAST_STATUS" -eq 0 ]]; then
+    _add_breaking "✓ $name OK  (L=output)"
+  else
+    _add_breaking "✗ $name FAILED  (L=output)"
+  fi
+}
+
+_trigger_scenarios() {
+  local trigger="$1"
+  local i
+  for i in "${!SCENARIO_NAMES[@]}"; do
+    [[ "${SCENARIO_ONS[$i]}" == "$trigger" ]] && _run_scenario "$i"
+  done
+}
+
+_draw_scenario_menu() {
+  if [[ "${#SCENARIO_NAMES[@]}" -eq 0 ]]; then
+    _add_breaking "⚠ no scenarios in .repo-report.yml"
+    return
+  fi
+  local total="${#SCENARIO_NAMES[@]}"
+  local sel=0 redraw=1 key i
+  local box_w=62
+  [[ "$box_w" -gt "$TERM_COLS" ]] && box_w=$((TERM_COLS - 2))
+  local inner=$((box_w - 4))
+  local box_h=$((total + 5))
+  local col=$(( (TERM_COLS - box_w) / 2 ))
+  local row=$(( (TERM_ROWS - box_h) / 2 ))
+  [[ "$col" -lt 1 ]] && col=1; [[ "$row" -lt 1 ]] && row=1
+  while true; do
+    if [[ "$redraw" -eq 1 ]]; then
+      redraw=0
+      local r="$row"
+      printf '\e[%d;%dH\e[7m╭' "$r" "$col"
+      for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╮\e[0m'
+      (( r++ ))
+      printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "RUN SCENARIO  (j/k select  Enter run  Esc cancel)"
+      (( r++ ))
+      printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+      (( r++ ))
+      for ((i=0; i<total; i++)); do
+        local pfx="  "
+        [[ "$i" -eq "$sel" ]] && pfx="> "
+        local tag="[${SCENARIO_ONS[$i]}]"
+        [[ -n "${SCENARIO_IFS[$i]}" ]] && tag+=" if:${SCENARIO_IFS[$i]}"
+        local lbl="${pfx}${SCENARIO_NAMES[$i]}  $tag"
+        if [[ "$i" -eq "$sel" ]]; then
+          printf '\e[%d;%dH\e[7m│\e[1;7m %-*s \e[0m\e[7m│\e[0m' "$r" "$col" "$inner" "$lbl"
+        else
+          printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "$lbl"
+        fi
+        (( r++ ))
+      done
+      printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+      (( r++ ))
+      printf '\e[%d;%dH\e[7m╰' "$r" "$col"
+      for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╯\e[0m'
+    fi
+    if read -rsn1 -t 0.3 key; then
+      case "$key" in
+        q|Q|$'\e') break ;;
+        $'\n')     _run_scenario "$sel"; break ;;
+        j) [[ "$sel" -lt $((total-1)) ]] && { ((sel++)); redraw=1; } ;;
+        k) [[ "$sel" -gt 0 ]]            && { ((sel--)); redraw=1; } ;;
+      esac
+    fi
+  done
+  _redraw_all
+}
+
+_draw_last_scenario_output() {
+  if [[ -z "$SCENARIO_LAST_NAME" ]]; then
+    _add_breaking "⚠ no scenario has run yet"
+    return
+  fi
+  local status_str="OK"
+  [[ "$SCENARIO_LAST_STATUS" -ne 0 ]] && status_str="FAILED (exit ${SCENARIO_LAST_STATUS})"
+  _OVERLAY_LINES=()
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done <<< "$SCENARIO_LAST_OUTPUT"
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(no output)")
+  _draw_scrollable_overlay "${SCENARIO_LAST_NAME} — ${status_str}"
+}
+
+_load_scenarios
+
 _add_breaking() {
   BREAKING="$BREAKING   $1"
   # keep last ~200 chars
@@ -493,7 +654,7 @@ _draw_help() {
   if [[ "$FILTER_MODE" -eq 1 ]]; then
     printf '\e[%d;1H\e[2K\e[2mfilter:\e[0m %s\e[2m█  (Enter=confirm  Esc=cancel)\e[0m' "$row" "$FILTER_INPUT"
   else
-    printf '\e[%d;1H\e[2K\e[2m j/k/g/G move  PgUp/PgDn page  / filter  s sort  d diff  f fetch  r rescan  ? help  q quit \e[0m' "$row"
+    printf '\e[%d;1H\e[2K\e[2m j/k/g/G move  PgUp/PgDn page  / filter  s sort  d diff  X scenario  f fetch  r rescan  ? help  q quit \e[0m' "$row"
   fi
 }
 
@@ -522,6 +683,7 @@ _start_scan() {
   TOTAL="${#GIT_PATHS[@]}"
   ROWS=(); VIEW=(); SELECTED=0; SCROLL=0
   SCANNED=0; BEHIND_N=0; DIRTY_N=0; DIVERGED_N=0; AHEAD_N=0
+  SCAN_DONE_TRIGGERED=0
   BREAKING=""
 
   export REPO_REPORT_FETCH="$FETCH"
@@ -557,7 +719,13 @@ _drain_scan() {
     got=1
     [[ "$got" -ge 50 ]] && break
   done
-  [[ "$got" -eq 1 ]] && _rebuild_view
+  if [[ "$got" -eq 1 ]]; then
+    _rebuild_view
+    if [[ "$SCANNED" -eq "$TOTAL" && "$TOTAL" -gt 0 && "$SCAN_DONE_TRIGGERED" -eq 0 ]]; then
+      SCAN_DONE_TRIGGERED=1
+      _trigger_scenarios scan_done
+    fi
+  fi
 }
 
 _prompt_export() {
@@ -595,7 +763,7 @@ _prompt_export() {
 }
 
 _draw_help_overlay() {
-  local box_w=46 box_h=36
+  local box_w=46 box_h=38
   local col=$(( (TERM_COLS - box_w) / 2 ))
   local row=$(( (TERM_ROWS - box_h) / 2 ))
   [[ "$col" -lt 1 ]] && col=1
@@ -626,6 +794,8 @@ _draw_help_overlay() {
     "  :           repo forall   (AOSP)      "
     "  B           repo start    (AOSP)      "
     "  A           repo abandon  (AOSP)      "
+    "  X           run scenario              "
+    "  L           last scenario output      "
     "  e           export current view       "
     "  c           toggle column header      "
     "  ?           this help                 "
@@ -838,6 +1008,7 @@ _run_repo_sync_n() {
   local rpid=$!
   wait "$rpid" 2>/dev/null || true
   _add_breaking "✓ repo sync -n done"
+  _trigger_scenarios sync_done
   _start_scan; _redraw_all
 }
 
@@ -902,6 +1073,7 @@ _run_repo_sync() {
   local rpid=$!
   wait "$rpid" 2>/dev/null || true
   _add_breaking "✓ repo sync done"
+  _trigger_scenarios sync_done
   _start_scan
   _redraw_all
 }
@@ -1016,6 +1188,8 @@ _tui_main() {
           n) _run_repo_sync_n ;;
           B) _prompt_repo_start ;;
           A) _prompt_repo_abandon ;;
+          X) _draw_scenario_menu ;;
+          L) _draw_last_scenario_output ;;
           ':') _prompt_repo_forall ;;
           $'\e')
             read -rsn1 -t 0.005 seq2 || { FILTER=""; _rebuild_view; continue; }
