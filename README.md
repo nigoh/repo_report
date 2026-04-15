@@ -20,14 +20,31 @@ either require pre-registering repos or don't emit a compact machine-readable
 report suitable for "is everything up-to-date?" checks across a `.repo`
 workspace.
 
-## Install
+## Usage without installing
+
+After cloning, the script is immediately runnable — no install step needed:
 
 ```sh
-# copy / symlink onto your PATH
+git clone https://github.com/nigoh/repo_report.git
+cd repo_report
+./bin/repo-report /path/to/workspace
+```
+
+## Install (optional — adds `repo-report` to your PATH)
+
+```sh
+# via Makefile (installs to /usr/local/bin by default)
+make install
+# or to a custom prefix
+make install PREFIX=~/.local
+
+# manually
 install -m0755 bin/repo-report /usr/local/bin/repo-report
-# or
+# or with a symlink
 ln -s "$PWD/bin/repo-report" ~/.local/bin/repo-report
 ```
+
+To uninstall: `make uninstall`
 
 Dependencies: `bash` (>=4), `git`, `find`, `xargs`, `awk`, `mkfifo`.
 `column` is optional (used for table alignment in `--format table`).

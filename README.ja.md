@@ -7,14 +7,31 @@
 
 通常のツール（`gita`、`mr`、`ghq`、Google `repo`）はリポジトリの事前登録が必要だったり、`.repo` ワークスペース全体で「すべて最新か？」を確認するためのコンパクトな機械可読レポートを出力できなかったりするため、このツールを作成しました。
 
-## インストール
+## インストール不要で今すぐ使う
+
+クローン直後からスクリプトをそのまま実行できます — インストール不要：
 
 ```sh
-# PATH の通った場所にコピー / シンボリックリンク
+git clone https://github.com/nigoh/repo_report.git
+cd repo_report
+./bin/repo-report /path/to/workspace
+```
+
+## インストール（任意 — `repo-report` を PATH に追加する場合）
+
+```sh
+# Makefile 経由（デフォルトは /usr/local/bin）
+make install
+# カスタムプレフィックスを指定する場合
+make install PREFIX=~/.local
+
+# 手動でコピー
 install -m0755 bin/repo-report /usr/local/bin/repo-report
-# または
+# またはシンボリックリンク
 ln -s "$PWD/bin/repo-report" ~/.local/bin/repo-report
 ```
+
+アンインストール：`make uninstall`
 
 依存関係：`bash`（>=4）、`git`、`find`、`xargs`、`awk`、`mkfifo`。  
 `column` は任意（`--format table` でのテーブル整形に使用）。
