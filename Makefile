@@ -12,6 +12,7 @@ test:
 	@bash -n bin/repo-report && echo "syntax OK"
 	@bash tests/test_noninteractive.sh
 	@bash tests/test_repo_detection.sh
+	@bash tests/test_repo_commands.sh
 
 test-tui:
 	@echo "Running TUI key tests (requires a real TTY)..."

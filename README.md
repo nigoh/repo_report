@@ -92,9 +92,17 @@ initial scan.
 | `Enter`          | open detail pane for selected repo                  |
 | `s`              | cycle sort mode: `path` → `status` → `date` → `branch` → `ahead-desc` → `behind-desc` |
 | `f`              | toggle `--fetch` flag and rescan                    |
-| `F`              | run `repo sync` (AOSP workspaces only — requires `.repo/`) |
+| `F`              | run `repo sync` (AOSP only)                         |
 | `r`              | rescan (re-runs `find` + workers)                   |
-| `T`              | show `repo status` overlay (AOSP workspaces only)   |
+| `d`              | diff overlay for selected repo (`git diff` + staged)|
+| `T`              | `repo status` overlay (AOSP only)                   |
+| `b`              | `repo branches` overlay (AOSP only)                 |
+| `o`              | `repo overview` overlay (AOSP only)                 |
+| `m`              | manifest XML overlay (AOSP only)                    |
+| `n`              | `repo sync -n` — fetch only, no local update (AOSP only) |
+| `B`              | `repo start <branch> --all` — start topic branch (AOSP only) |
+| `A`              | `repo abandon <branch>` — delete topic branch, with confirmation (AOSP only) |
+| `:`              | `repo forall -c <cmd>` — run command on all projects (AOSP only; destructive commands blocked) |
 | `e`              | export current (filtered/sorted) view to a file     |
 | `c`              | toggle column header row                            |
 | `?`              | show full key-binding help overlay                  |
@@ -116,8 +124,17 @@ initial scan.
 When the scan root contains a `.repo/` directory, `repo-report` detects it as
 an AOSP workspace and enables additional keys:
 
-- `F` — runs `repo sync -j<jobs>` to sync the entire manifest
-- `T` — shows an overlay with the output of `repo status`
+| Key | Command | Notes |
+| --- | ------- | ----- |
+| `F` | `repo sync` | Full sync — destructive, use with care |
+| `n` | `repo sync -n` | Fetch only — safe, no local update |
+| `T` | `repo status` | All project status |
+| `b` | `repo branches` | Branch list across all projects |
+| `o` | `repo overview` | Recent commit summary |
+| `m` | manifest XML | Contents of `.repo/manifest.xml` |
+| `B` | `repo start <branch> --all` | Start topic branch on all projects |
+| `A` | `repo abandon <branch>` | Delete topic branch (confirmation required) |
+| `:` | `repo forall -c <cmd>` | Run arbitrary command on all projects; `reset --hard`, `clean -f`, `rm -rf` are blocked |
 
 The current manifest branch is shown in the status bar as `repo:<branch>`.
 These keys are silently ignored in non-AOSP workspaces.

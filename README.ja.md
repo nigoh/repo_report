@@ -76,10 +76,18 @@ repo-report /path/to/workspace
 | `Enter`           | 選択リポジトリの詳細ペインを開く                            |
 | `s`               | ソートモードをサイクル: `path` → `status` → `date` → `branch` → `ahead-desc` → `behind-desc` |
 | `f`               | `--fetch` フラグを切り替えて再スキャン                      |
-| `F`               | `repo sync` を実行（AOSP ワークスペース専用 — `.repo/` が必要） |
+| `F`               | `repo sync` を実行（AOSP 専用）                             |
 | `r`               | 再スキャン（`find` とワーカーを再実行）                     |
-| `T`               | `repo status` オーバーレイを表示（AOSP ワークスペース専用）  |
-| `e`               | 現在の（フィルタ済み・ソート済み）ビューをファイルにエクスポート |
+| `d`               | 選択リポジトリの差分オーバーレイ（`git diff` + staged）     |
+| `T`               | `repo status` オーバーレイ（AOSP 専用）                     |
+| `b`               | `repo branches` オーバーレイ（AOSP 専用）                   |
+| `o`               | `repo overview` オーバーレイ（AOSP 専用）                   |
+| `m`               | マニフェスト XML オーバーレイ（AOSP 専用）                  |
+| `n`               | `repo sync -n` — フェッチのみ・ローカル更新なし（AOSP 専用）|
+| `B`               | `repo start <branch> --all` — トピックブランチ作成（AOSP 専用）|
+| `A`               | `repo abandon <branch>` — トピックブランチ削除・確認あり（AOSP 専用）|
+| `:`               | `repo forall -c <cmd>` — 全プロジェクトにコマンド実行（AOSP 専用・破壊的コマンドはブロック）|
+| `e`               | 現在のビューをファイルにエクスポート                        |
 | `c`               | カラムヘッダ行をトグル                                      |
 | `?`               | 全キーバインドのヘルプオーバーレイを表示                    |
 | `q` / Ctrl-C      | 終了（端末を復元）                                          |
@@ -99,8 +107,17 @@ repo-report /path/to/workspace
 
 スキャンルートに `.repo/` ディレクトリが存在する場合、`repo-report` は自動的に AOSP ワークスペースとして検出し、追加キーを有効化します：
 
-- `F` — マニフェスト全体を `repo sync -j<jobs>` で同期
-- `T` — `repo status` の出力をオーバーレイ表示
+| キー | コマンド | 補足 |
+| ---- | -------- | ---- |
+| `F` | `repo sync` | フル同期 — 破壊的。注意して使用 |
+| `n` | `repo sync -n` | フェッチのみ — 安全、ローカル更新なし |
+| `T` | `repo status` | 全プロジェクトの状態 |
+| `b` | `repo branches` | 全プロジェクトのブランチ一覧 |
+| `o` | `repo overview` | 最近のコミットサマリー |
+| `m` | マニフェスト XML | `.repo/manifest.xml` の内容 |
+| `B` | `repo start <branch> --all` | 全プロジェクトでトピックブランチ作成 |
+| `A` | `repo abandon <branch>` | トピックブランチ削除（確認あり） |
+| `:` | `repo forall -c <cmd>` | 全プロジェクトに任意コマンド実行；`reset --hard`・`clean -f`・`rm -rf` はブロック |
 
 現在のマニフェストブランチはステータスバーに `repo:<branch>` として表示されます。非 AOSP ワークスペースではこれらのキーは無効です。
 

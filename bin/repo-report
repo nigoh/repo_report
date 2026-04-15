@@ -493,7 +493,7 @@ _draw_help() {
   if [[ "$FILTER_MODE" -eq 1 ]]; then
     printf '\e[%d;1H\e[2K\e[2mfilter:\e[0m %s\e[2m█  (Enter=confirm  Esc=cancel)\e[0m' "$row" "$FILTER_INPUT"
   else
-    printf '\e[%d;1H\e[2K\e[2m j/k/g/G move   PgUp/PgDn page   / filter   s sort   f fetch   r rescan   ? help   q quit \e[0m' "$row"
+    printf '\e[%d;1H\e[2K\e[2m j/k/g/G move  PgUp/PgDn page  / filter  s sort  d diff  f fetch  r rescan  ? help  q quit \e[0m' "$row"
   fi
 }
 
@@ -595,7 +595,7 @@ _prompt_export() {
 }
 
 _draw_help_overlay() {
-  local box_w=46 box_h=31
+  local box_w=46 box_h=36
   local col=$(( (TERM_COLS - box_w) / 2 ))
   local row=$(( (TERM_ROWS - box_h) / 2 ))
   [[ "$col" -lt 1 ]] && col=1
@@ -613,22 +613,26 @@ _draw_help_overlay() {
     "  /           filter (live, Esc=cancel) "
     "  Esc         clear filter              "
     "  Enter       open detail pane          "
+    "  d           diff of selected repo     "
     "  s           cycle sort mode           "
     "  f           toggle fetch + rescan     "
-    "  F           repo sync  (AOSP only)    "
+    "  n           repo sync -n  (AOSP)      "
+    "  F           repo sync     (AOSP)      "
     "  r           rescan                    "
-    "  T           repo status  (AOSP only)  "
+    "  T           repo status   (AOSP)      "
+    "  b           repo branches (AOSP)      "
+    "  o           repo overview (AOSP)      "
+    "  m           repo manifest (AOSP)      "
+    "  :           repo forall   (AOSP)      "
+    "  B           repo start    (AOSP)      "
+    "  A           repo abandon  (AOSP)      "
     "  e           export current view       "
     "  c           toggle column header      "
     "  ?           this help                 "
     "  q           quit                      "
     "                                        "
-    "  Colours                               "
-    "  green    = up-to-date                 "
-    "  yellow   = behind                     "
-    "  cyan     = ahead                      "
-    "  red      = diverged                   "
-    "  grey     = no-upstream                "
+    "  green=ok  yellow=behind  cyan=ahead   "
+    "  red=diverged  grey=no-upstream        "
     "  yellow s:N = stash count              "
     "                                        "
     "        press any key to dismiss        "
@@ -700,6 +704,194 @@ _open_detail() {
   printf '╯\e[0m'
   read -rsn1 -t 60 _ || true
   _redraw_all
+}
+
+# _draw_scrollable_overlay TITLE
+# Reads lines from global _OVERLAY_LINES array. j/k scroll, q/Esc/Enter to close.
+_draw_scrollable_overlay() {
+  local title="$1"
+  local total="${#_OVERLAY_LINES[@]}"
+  local box_w=$(( TERM_COLS - 4 ))
+  [[ "$box_w" -gt 110 ]] && box_w=110
+  local inner=$(( box_w - 4 ))
+  local box_h=$(( TERM_ROWS - 4 ))
+  [[ "$box_h" -lt 6 ]] && box_h=6
+  local visible=$(( box_h - 4 ))
+  local col=$(( (TERM_COLS - box_w) / 2 ))
+  local row=$(( (TERM_ROWS - box_h) / 2 ))
+  [[ "$col" -lt 1 ]] && col=1
+  [[ "$row" -lt 1 ]] && row=1
+  local scroll=0 redraw=1 key i r li
+  while true; do
+    if [[ "$redraw" -eq 1 ]]; then
+      redraw=0
+      printf '\e[%d;%dH' "$row" "$col"
+      printf '\e[7m╭'; for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╮\e[0m'
+      r=$(( row + 1 ))
+      printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" \
+        "${title}  [$(( scroll+1 ))-$(( scroll+visible < total ? scroll+visible : total ))/${total}]"
+      (( r++ ))
+      printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+      (( r++ ))
+      local end=$(( row + box_h - 2 ))
+      for ((li=scroll; li<total && r<end; li++, r++)); do
+        printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" "${_OVERLAY_LINES[$li]:0:$inner}"
+      done
+      while [[ "$r" -lt "$end" ]]; do
+        printf '\e[%d;%dH\e[7m│\e[0m %-*s \e[7m│\e[0m' "$r" "$col" "$inner" ""
+        (( r++ ))
+      done
+      printf '\e[%d;%dH\e[7m│\e[0m%-*s\e[7m│\e[0m' "$r" "$col" "$(( box_w - 2 ))" \
+        "$(printf '%*s' "$(( box_w - 2 ))" ' j/k scroll · q/Esc close ')"
+      (( r++ ))
+      printf '\e[%d;%dH\e[7m╰' "$r" "$col"
+      for ((i=0;i<box_w-2;i++)); do printf '─'; done; printf '╯\e[0m'
+    fi
+    if read -rsn1 -t 0.3 key; then
+      case "$key" in
+        q|Q|$'\e') break ;;
+        $'\n') break ;;
+        j) [[ $(( scroll + visible )) -lt "$total" ]] && { (( scroll++ )); redraw=1; } ;;
+        k) [[ "$scroll" -gt 0 ]] && { (( scroll-- )); redraw=1; } ;;
+      esac
+    fi
+  done
+  _redraw_all
+}
+
+# --- repo diff (d): diff of selected repo ---
+_draw_repo_diff_overlay() {
+  [[ "${#VIEW[@]}" -eq 0 ]] && return
+  local idx="${VIEW[$SELECTED]}"
+  local repo
+  IFS=$'\t' read -r repo _ _ _ _ _ _ _ _ _ _ <<< "${ROWS[$idx]}"
+  _OVERLAY_LINES=()
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done \
+    < <(git -C "$repo" diff 2>&1; git -C "$repo" diff --cached 2>&1)
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(no diff — working tree is clean)")
+  _draw_scrollable_overlay "diff: ${repo##*/}"
+}
+
+# --- repo branches (b): branch list across all projects ---
+_draw_repo_branches_overlay() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  _OVERLAY_LINES=()
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done < <(repo branches 2>&1)
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(no branches)")
+  _draw_scrollable_overlay "repo branches"
+}
+
+# --- repo overview (o): recent commit summary ---
+_draw_repo_overview_overlay() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  _OVERLAY_LINES=()
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done < <(repo overview 2>&1)
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(no output)")
+  _draw_scrollable_overlay "repo overview"
+}
+
+# --- repo manifest (m): active manifest XML ---
+_draw_repo_manifest_overlay() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  local mf="${ROOT}/.repo/manifest.xml"
+  _OVERLAY_LINES=()
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done < <(cat "$mf" 2>&1)
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(manifest not found: $mf)")
+  _draw_scrollable_overlay "manifest.xml"
+}
+
+# --- repo forall (:): run arbitrary command on all projects ---
+_prompt_repo_forall() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  local row="$TERM_ROWS"
+  printf '\e[%d;1H\e[2K\e[?25h' "$row"
+  stty sane 2>/dev/null || true
+  printf 'repo forall -c (empty=cancel): '
+  local cmd
+  IFS= read -r cmd
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '\e[?25l'
+  [[ -z "$cmd" ]] && { _redraw_all; return; }
+  # Block destructive commands
+  case "$cmd" in
+    *"reset --hard"*|*"clean -f"*|*"clean -fd"*|*"rm -rf"*)
+      _add_breaking "⚠ blocked: potentially destructive command"
+      _redraw_all; return ;;
+  esac
+  _OVERLAY_LINES=()
+  _add_breaking "⟳ repo forall -c $cmd"
+  while IFS= read -r l; do _OVERLAY_LINES+=("$l"); done \
+    < <(repo forall -c "$cmd" 2>&1)
+  [[ "${#_OVERLAY_LINES[@]}" -eq 0 ]] && _OVERLAY_LINES=("(no output)")
+  _draw_scrollable_overlay "repo forall -c $cmd"
+}
+
+# --- repo sync -n (n): network fetch only ---
+_run_repo_sync_n() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  _add_breaking "⟳ repo sync -n (fetch only)..."
+  ( repo sync -n -j"$JOBS" -q 2>&1 ) &
+  local rpid=$!
+  wait "$rpid" 2>/dev/null || true
+  _add_breaking "✓ repo sync -n done"
+  _start_scan; _redraw_all
+}
+
+# --- repo start (B): start topic branch on all projects ---
+_prompt_repo_start() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  local row="$TERM_ROWS"
+  printf '\e[%d;1H\e[2K\e[?25h' "$row"
+  stty sane 2>/dev/null || true
+  printf 'repo start — branch name (empty=cancel): '
+  local branch
+  IFS= read -r branch
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '\e[?25l'
+  [[ -z "$branch" ]] && { _redraw_all; return; }
+  _add_breaking "⟳ repo start $branch --all..."
+  ( repo start "$branch" --all 2>&1 ) &
+  local rpid=$!
+  wait "$rpid" 2>/dev/null || true
+  _add_breaking "✓ repo start $branch done"
+  _start_scan; _redraw_all
+}
+
+# --- repo abandon (A): delete topic branch on all projects (with confirmation) ---
+_prompt_repo_abandon() {
+  [[ "$IS_REPO_WS" -eq 0 ]] && { _add_breaking "⚠ not an AOSP workspace"; return; }
+  command -v repo >/dev/null 2>&1 || { _add_breaking "⚠ repo not found on PATH"; return; }
+  local row="$TERM_ROWS"
+  printf '\e[%d;1H\e[2K\e[?25h' "$row"
+  stty sane 2>/dev/null || true
+  printf 'repo abandon — branch name (empty=cancel): '
+  local branch
+  IFS= read -r branch
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '\e[?25l'
+  [[ -z "$branch" ]] && { _redraw_all; return; }
+  # Confirmation step
+  printf '\e[%d;1H\e[2K\e[?25h' "$row"
+  stty sane 2>/dev/null || true
+  printf '\e[31mAbandon branch "%s" on ALL projects?\e[0m [y/N]: ' "$branch"
+  local confirm
+  IFS= read -r confirm
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  printf '\e[?25l'
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    _add_breaking "✗ abandon cancelled"; _redraw_all; return
+  fi
+  _add_breaking "⟳ repo abandon $branch..."
+  ( repo abandon "$branch" 2>&1 ) &
+  local rpid=$!
+  wait "$rpid" 2>/dev/null || true
+  _add_breaking "✓ repo abandon $branch done"
+  _start_scan; _redraw_all
 }
 
 _run_repo_sync() {
@@ -817,6 +1009,14 @@ _tui_main() {
             _draw_help ;;
           F) _run_repo_sync ;;
           T) _draw_repo_status_overlay ;;
+          d) _draw_repo_diff_overlay ;;
+          b) _draw_repo_branches_overlay ;;
+          o) _draw_repo_overview_overlay ;;
+          m) _draw_repo_manifest_overlay ;;
+          n) _run_repo_sync_n ;;
+          B) _prompt_repo_start ;;
+          A) _prompt_repo_abandon ;;
+          ':') _prompt_repo_forall ;;
           $'\e')
             read -rsn1 -t 0.005 seq2 || { FILTER=""; _rebuild_view; continue; }
             read -rsn1 -t 0.005 seq3 || continue
