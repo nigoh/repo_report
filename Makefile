@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local
 
-.PHONY: install install-tui uninstall build build-tui test test-tui
+.PHONY: install install-tui uninstall build build-tui test test-tui test-rust test-rust-integration
 
 # Bash version (original)
 install:
@@ -29,3 +29,7 @@ test-tui:
 
 test-rust:
 	cargo test
+	@bash tests/test_rust_noninteractive.sh
+
+test-rust-integration:
+	@bash tests/test_rust_noninteractive.sh

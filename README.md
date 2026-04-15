@@ -2,7 +2,17 @@
 
 [日本語版 README はこちら](README.ja.md)
 
-![repo-report demo](demo.gif)
+**Bash edition** (`bin/repo-report`)
+
+![repo-report Bash edition demo](demo.gif)
+
+**Ratatui/Rust edition** (`repo-report-tui`) — standard workspace
+
+![repo-report-tui standard mode](demo-tui.svg)
+
+**Ratatui/Rust edition** — AOSP workspace (`.repo/` detected)
+
+![repo-report-tui AOSP mode](demo-tui-aosp.svg)
 
 `repo-report` is a single-file Bash CLI that walks a directory tree, finds
 every nested git repository (both `.git` directories and `.git` gitfile

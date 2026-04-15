@@ -168,3 +168,100 @@ pub enum Overlay {
     AospConfirm,  // destructive-op confirmation dialog
     AospPrompt,   // single-line text input box
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SortMode ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sort_mode_cycles_through_all_variants() {
+        let start = SortMode::Path;
+        let mut mode = start;
+        let variants = [
+            SortMode::Path,
+            SortMode::Status,
+            SortMode::Date,
+            SortMode::Branch,
+            SortMode::AheadDesc,
+            SortMode::BehindDesc,
+        ];
+        for expected in variants {
+            assert_eq!(mode, expected);
+            mode = mode.next();
+        }
+        // Should wrap back to Path
+        assert_eq!(mode, SortMode::Path);
+    }
+
+    #[test]
+    fn sort_mode_labels_are_non_empty() {
+        for mode in [SortMode::Path, SortMode::Status, SortMode::Date,
+                     SortMode::Branch, SortMode::AheadDesc, SortMode::BehindDesc] {
+            assert!(!mode.label().is_empty(), "label for {:?} should not be empty", mode);
+        }
+    }
+
+    // ── RepoStatus ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn repo_status_as_str_round_trips() {
+        let cases = [
+            (RepoStatus::UpToDate, "up-to-date"),
+            (RepoStatus::Behind, "behind"),
+            (RepoStatus::Ahead, "ahead"),
+            (RepoStatus::Diverged, "diverged"),
+            (RepoStatus::NoUpstream, "no-upstream"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(status.as_str(), expected);
+        }
+    }
+
+    // ── AospOp ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn aosp_op_labels_are_non_empty() {
+        let ops = [
+            AospOp::RepoSync, AospOp::RepoSyncN, AospOp::RepoStatus,
+            AospOp::RepoBranches, AospOp::RepoOverview, AospOp::RepoManifest,
+            AospOp::RepoStart, AospOp::RepoAbandon, AospOp::RepoForall,
+            AospOp::RepoDownload, AospOp::MakeBuild, AospOp::MakeClean,
+        ];
+        for op in ops {
+            assert!(!op.label().is_empty(), "label for {:?} is empty", op);
+        }
+    }
+
+    #[test]
+    fn aosp_op_prompt_hint_present_for_interactive_ops() {
+        assert!(AospOp::RepoStart.prompt_hint().is_some());
+        assert!(AospOp::RepoAbandon.prompt_hint().is_some());
+        assert!(AospOp::RepoForall.prompt_hint().is_some());
+        assert!(AospOp::RepoDownload.prompt_hint().is_some());
+    }
+
+    #[test]
+    fn aosp_op_prompt_hint_absent_for_direct_ops() {
+        assert!(AospOp::RepoSync.prompt_hint().is_none());
+        assert!(AospOp::RepoSyncN.prompt_hint().is_none());
+        assert!(AospOp::RepoStatus.prompt_hint().is_none());
+        assert!(AospOp::MakeBuild.prompt_hint().is_none());
+        assert!(AospOp::MakeClean.prompt_hint().is_none());
+    }
+
+    // ── RepoInfo ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn repo_info_dirty_str() {
+        let make = |dirty: bool| RepoInfo {
+            repo: "x".into(), branch: "main".into(), sha: "abc".into(),
+            date: String::new(), ahead: 0, behind: 0, dirty,
+            status: RepoStatus::UpToDate, remote: String::new(),
+            message: String::new(), stash: 0,
+        };
+        assert_eq!(make(true).dirty_str(), "dirty");
+        assert_eq!(make(false).dirty_str(), "clean");
+    }
+}
