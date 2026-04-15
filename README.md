@@ -128,18 +128,109 @@ an AOSP workspace and enables additional keys:
 
 | Key | Command | Notes |
 | --- | ------- | ----- |
-| `F` | `repo sync` | Full sync — destructive, use with care |
+| `F` | `repo sync -c -j{N} --no-tags` | Recommended full sync with optimised options |
 | `n` | `repo sync -n` | Fetch only — safe, no local update |
 | `T` | `repo status` | All project status |
 | `b` | `repo branches` | Branch list across all projects |
 | `o` | `repo overview` | Recent commit summary |
 | `m` | manifest XML | Contents of `.repo/manifest.xml` |
+| `D` | `repo download <project> <change>` | Pull a Gerrit review patch locally |
+| `M` | `make -j{N}` | Build |
+| `C` | `make clean` | Remove intermediate files (confirmation required) |
 | `B` | `repo start <branch> --all` | Start topic branch on all projects |
 | `A` | `repo abandon <branch>` | Delete topic branch (confirmation required) |
 | `:` | `repo forall -c <cmd>` | Run arbitrary command on all projects; `reset --hard`, `clean -f`, `rm -rf` are blocked |
 
-The current manifest branch is shown in the status bar as `repo:<branch>`.
+The current manifest branch is shown in the status bar as `[AOSP] repo:<branch>`.
+A spinner appears in the ticker while a command is running.
 These keys are silently ignored in non-AOSP workspaces.
+
+---
+
+## AOSP Operation Guidelines
+
+> Standard operating procedure for Android / AOSP development teams.  
+> All commands below can be run directly from `repo-report-tui` key bindings.
+
+### Recommended daily workflow
+
+```
+1. T key  → repo status              Check current changed state
+2. F key  → repo sync -c -j8 --no-tags   Sync to latest (recommended options)
+3. M key  → make -j8                 Build
+```
+
+On build error:
+
+```
+4. C key  → make clean   Remove intermediate files (confirmation dialog)
+   → press M again to rebuild
+```
+
+For a full reset, run `make clobber` manually in the terminal.
+
+### `repo sync` recommended options
+
+| Option | Effect |
+|--------|--------|
+| `-c` | Fetch only the current branch (skip unneeded branches) |
+| `-j8` | Parallel download count (adjust to your environment; change with `-j` flag) |
+| `--no-tags` | Skip fetching tags for faster sync |
+
+`F` key applies all these options automatically.  
+`n` key runs `repo sync -n` (fetch only, no local update) — **safe, no side effects**.
+
+### `repo download` (fetching Gerrit patches)
+
+Press `D` and a prompt appears:
+
+```
+Input:   platform/frameworks/base 12345
+Runs:    repo download platform/frameworks/base 12345
+```
+
+Unlike `repo sync`, this lets you locally test review patches that have not yet been merged.
+
+| Command | Target | Primary use |
+|---------|--------|-------------|
+| `F` (repo sync) | Merged remote branches | Routine latest-code sync |
+| `D` (repo download) | In-review Gerrit patches | Verify another developer's patch locally |
+
+### Build operations (`make`)
+
+| Key | Command | Deletes | When to use |
+|-----|---------|---------|-------------|
+| `M` | `make -j{N}` | (nothing) | Normal build — try this first |
+| `C` | `make clean` | Intermediate files | When build errors persist |
+| — | `make clobber` *(manual)* | Entire `out/` | When a full reset is required |
+
+> **Policy:** `make clean` has a high time cost, so attempt builds without clean first.  
+> Only press `C` when errors don't resolve without it.
+
+**When `make clean` is needed:**
+- Header files or shared libraries have changed significantly
+- Build errors don't resolve without clean
+- A long time has passed since the last sync
+
+### Safety features
+
+`repo forall -c` (`:` key) blocks commands matching these patterns:
+
+```
+reset --hard  /  clean -f  /  clean -fd  /  rm -rf  /  rm -fr
+push --force  /  push -f   /  format
+```
+
+`make clean` (`C` key) and `repo abandon` (`A` key) show a confirmation dialog before executing.
+
+### Troubleshooting
+
+| Symptom | Resolution |
+|---------|------------|
+| `repo sync` fails partway | Check network, then press `F` again (safe — incremental fetch) |
+| Build errors keep repeating | Press `C` for `make clean`, then `M` to rebuild |
+| Unstable behaviour / tests failing | Run `make clobber` manually, then full rebuild |
+| Want to test someone else's patch | Use `D` key for `repo download` |
 
 ## Non-interactive mode
 

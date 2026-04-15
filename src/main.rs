@@ -1,9 +1,10 @@
-mod types;
-mod git;
-mod scanner;
+mod aosp;
 mod app;
-mod ui;
+mod git;
 mod output;
+mod scanner;
+mod types;
+mod ui;
 
 use std::io;
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::app::App;
 use crate::scanner::{find_repos, is_aosp};
-use crate::types::{OutputFormat, Overlay};
+use crate::types::{AospOp, InputMode, Overlay, OutputFormat};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Format {
@@ -31,7 +32,11 @@ enum Format {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "repo-report-tui", version = "0.3.0", about = "Git repository status reporter (Ratatui edition)")]
+#[command(
+    name = "repo-report-tui",
+    version = "0.3.0",
+    about = "Git repository status reporter — Ratatui edition"
+)]
 struct Cli {
     /// Root directory to scan
     #[arg(default_value = ".")]
@@ -45,25 +50,33 @@ struct Cli {
     #[arg(short, long)]
     fetch: bool,
 
-    /// Maximum depth to scan for repos
+    /// Maximum directory depth to scan for repos
     #[arg(long, default_value = "5")]
     max_depth: usize,
 
-    /// Maximum message column width (table format)
+    /// Column width for commit message in table format
     #[arg(long, default_value = "60")]
     msg_width: usize,
 
     /// Non-interactive mode (equivalent to --format tsv)
     #[arg(long)]
     non_interactive: bool,
+
+    /// Parallel job count (default: number of logical CPUs)
+    #[arg(short, long)]
+    jobs: Option<usize>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     let root = cli.root.canonicalize().unwrap_or(cli.root.clone());
 
-    // Determine output format
+    let jobs = cli.jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+
     let is_tty = atty_check();
     let format = match cli.format {
         Some(Format::Tsv) => OutputFormat::Tsv,
@@ -77,9 +90,9 @@ fn main() -> Result<()> {
 
     match format {
         OutputFormat::Tsv | OutputFormat::Json | OutputFormat::Table => {
-            run_non_interactive(&root, cli.fetch, cli.max_depth, cli.msg_width, format)
+            run_non_interactive(&root, cli.fetch, cli.max_depth, cli.msg_width, jobs, format)
         }
-        OutputFormat::Tui => run_tui(&root, cli.fetch, cli.max_depth),
+        OutputFormat::Tui => run_tui(&root, cli.fetch, cli.max_depth, jobs),
     }
 }
 
@@ -88,17 +101,14 @@ fn run_non_interactive(
     fetch: bool,
     max_depth: usize,
     msg_width: usize,
+    _jobs: usize,
     format: OutputFormat,
 ) -> Result<()> {
     use rayon::prelude::*;
     use crate::git::scan_repo;
 
-    let repos_paths = find_repos(root, max_depth);
-    let mut repos: Vec<_> = repos_paths
-        .par_iter()
-        .map(|p| scan_repo(p, fetch, root))
-        .collect();
-
+    let paths = find_repos(root, max_depth);
+    let mut repos: Vec<_> = paths.par_iter().map(|p| scan_repo(p, fetch, root)).collect();
     repos.sort_by(|a, b| a.repo.cmp(&b.repo));
 
     match format {
@@ -108,35 +118,26 @@ fn run_non_interactive(
         _ => unreachable!(),
     }
 
-    // Exit code: 0 if all clean+up-to-date, 1 otherwise
     let all_good = repos.iter().all(|r| {
-        !r.dirty
-            && matches!(
-                r.status,
-                crate::types::RepoStatus::UpToDate | crate::types::RepoStatus::NoUpstream
-            )
+        !r.dirty && matches!(r.status, crate::types::RepoStatus::UpToDate | crate::types::RepoStatus::NoUpstream)
     });
     std::process::exit(if all_good { 0 } else { 1 });
 }
 
-fn run_tui(root: &PathBuf, fetch: bool, max_depth: usize) -> Result<()> {
+fn run_tui(root: &PathBuf, fetch: bool, max_depth: usize, jobs: usize) -> Result<()> {
     let aosp = is_aosp(root);
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Build app and start scan
-    let mut app = App::new(root.clone(), fetch, max_depth, aosp);
+    let mut app = App::new(root.clone(), fetch, max_depth, aosp, jobs);
     app.start_scan();
 
-    // Sort mode cycling needs access to app, handle via event
     let result = run_event_loop(&mut terminal, &mut app);
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -149,82 +150,165 @@ fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
-        // Drain incoming scan results
         app.drain_scan();
-
-        // Animate ticker
+        app.drain_aosp();
         app.tick();
 
-        // Render
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Handle input (non-blocking, 100ms timeout)
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(app, key.code, key.modifiers);
                 }
-                handle_key(app, key.code, key.modifiers);
-            }
-
-            if let Event::Resize(_, _) = event::read().unwrap_or(Event::FocusLost) {
-                // ratatui handles resize automatically via terminal.draw
+                _ => {}
             }
         }
 
-        if app.should_quit {
-            break;
-        }
+        if app.should_quit { break; }
     }
     Ok(())
 }
 
+// ─── Key handling ─────────────────────────────────────────────────────────────
+
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
-    // Filter mode captures text
-    if app.filter_mode {
-        match code {
-            KeyCode::Esc => {
-                app.filter_mode = false;
-                app.filter.clear();
-                app.rebuild_filtered();
-            }
-            KeyCode::Enter => {
-                app.filter_mode = false;
-            }
-            KeyCode::Backspace => {
-                app.filter.pop();
-                app.rebuild_filtered();
-            }
-            KeyCode::Char(c) => {
-                app.filter.push(c);
-                app.rebuild_filtered();
-            }
-            _ => {}
-        }
-        return;
+    match app.input_mode.clone() {
+        InputMode::Filter => handle_key_filter(app, code),
+        InputMode::AospPrompt(op) => handle_key_aosp_prompt(app, op, code),
+        InputMode::AospConfirm(op) => handle_key_aosp_confirm(app, op, code),
+        InputMode::Normal => handle_key_normal(app, code, modifiers),
     }
+}
 
-    // Overlay mode: only Esc / j / k handled
-    if app.overlay.is_some() {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.overlay = None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if app.overlay == Some(Overlay::Diff) {
-                    let max = app.diff_lines.len().saturating_sub(1);
-                    app.diff_scroll = (app.diff_scroll + 1).min(max);
+fn handle_key_filter(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Normal;
+            app.filter.clear();
+            app.rebuild_filtered();
+        }
+        KeyCode::Enter => {
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.filter.pop();
+            app.rebuild_filtered();
+        }
+        KeyCode::Char(c) => {
+            app.filter.push(c);
+            app.rebuild_filtered();
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_aosp_prompt(app: &mut App, op: AospOp, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.input_mode = InputMode::Normal;
+            app.overlay = None;
+        }
+        KeyCode::Enter => {
+            let arg = app.aosp_prompt_buf.trim().to_string();
+            app.launch_aosp_op(op, Some(arg));
+        }
+        KeyCode::Backspace => {
+            app.aosp_prompt_buf.pop();
+        }
+        KeyCode::Char(c) => {
+            app.aosp_prompt_buf.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_aosp_confirm(app: &mut App, op: AospOp, code: KeyCode) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Ops that still need a text argument after confirmation
+            match op {
+                AospOp::RepoAbandon => {
+                    app.input_mode = InputMode::Normal;
+                    app.overlay = None;
+                    app.start_aosp_prompt(AospOp::RepoAbandon);
+                }
+                _ => {
+                    app.launch_aosp_op(op, None);
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if app.overlay == Some(Overlay::Diff) {
-                    app.diff_scroll = app.diff_scroll.saturating_sub(1);
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
+            app.input_mode = InputMode::Normal;
+            app.overlay = None;
+        }
+        _ => {}
+    }
+}
+
+fn handle_key_normal(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    // Handle open overlays first (scroll only, Esc to close)
+    if let Some(overlay) = app.overlay {
+        match overlay {
+            Overlay::AospCommand | Overlay::AospManifest => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        // Keep overlay open while command is running, allow close when done
+                        if !app.aosp_running {
+                            app.overlay = None;
+                        }
+                    }
+                    KeyCode::Char('x') => app.overlay = None, // force close
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        let max = app.aosp_output.len().saturating_sub(1);
+                        app.aosp_scroll = (app.aosp_scroll + 1).min(max);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.aosp_scroll = app.aosp_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        let max = app.aosp_output.len().saturating_sub(1);
+                        app.aosp_scroll = (app.aosp_scroll + 20).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        app.aosp_scroll = app.aosp_scroll.saturating_sub(20);
+                    }
+                    _ => {}
                 }
+                return;
             }
+            Overlay::Help | Overlay::Detail => {
+                // Any key closes these overlays
+                app.overlay = None;
+                return;
+            }
+            Overlay::Diff => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.overlay = None,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        let max = app.diff_lines.len().saturating_sub(1);
+                        app.diff_scroll = (app.diff_scroll + 1).min(max);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.diff_scroll = app.diff_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        let max = app.diff_lines.len().saturating_sub(1);
+                        app.diff_scroll = (app.diff_scroll + 20).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        app.diff_scroll = app.diff_scroll.saturating_sub(20);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // AospConfirm and AospPrompt are handled by their respective input modes
             _ => {}
         }
-        return;
     }
 
-    // Normal mode
+    // Normal navigation and commands
     match code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
@@ -255,12 +339,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.start_scan();
         }
 
-        KeyCode::Char('r') => {
-            app.start_scan();
-        }
+        KeyCode::Char('r') => app.start_scan(),
 
         KeyCode::Char('/') => {
-            app.filter_mode = true;
+            app.input_mode = InputMode::Filter;
         }
 
         KeyCode::Esc => {
@@ -272,6 +354,46 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 
         KeyCode::Char('c') => {
             app.show_header = !app.show_header;
+        }
+
+        // ── AOSP-only keys ──────────────────────────────────────────────────
+        KeyCode::Char('F') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoSync, None);
+        }
+        KeyCode::Char('n') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoSyncN, None);
+        }
+        KeyCode::Char('T') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoStatus, None);
+        }
+        KeyCode::Char('b') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoBranches, None);
+        }
+        KeyCode::Char('o') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoOverview, None);
+        }
+        KeyCode::Char('m') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::RepoManifest, None);
+        }
+        KeyCode::Char('D') if app.is_aosp => {
+            app.start_aosp_prompt(AospOp::RepoDownload);
+        }
+        KeyCode::Char('M') if app.is_aosp => {
+            app.launch_aosp_op(AospOp::MakeBuild, None);
+        }
+        KeyCode::Char('C') if app.is_aosp => {
+            app.aosp_op = Some(AospOp::MakeClean);
+            app.start_aosp_confirm(AospOp::MakeClean);
+        }
+        KeyCode::Char('B') if app.is_aosp => {
+            app.start_aosp_prompt(AospOp::RepoStart);
+        }
+        KeyCode::Char('A') if app.is_aosp => {
+            app.aosp_op = Some(AospOp::RepoAbandon);
+            app.start_aosp_confirm(AospOp::RepoAbandon);
+        }
+        KeyCode::Char(':') if app.is_aosp => {
+            app.start_aosp_prompt(AospOp::RepoForall);
         }
 
         _ => {}

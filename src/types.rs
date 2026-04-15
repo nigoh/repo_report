@@ -92,9 +92,79 @@ pub enum ScanEvent {
     Done,
 }
 
+/// AOSP operations that can be launched from the TUI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AospOp {
+    RepoSync,       // F: repo sync -c -j{jobs} --no-tags
+    RepoSyncN,      // n: repo sync -n
+    RepoStatus,     // T: repo status
+    RepoBranches,   // b: repo branches
+    RepoOverview,   // o: repo overview
+    RepoManifest,   // m: .repo/manifest.xml viewer
+    RepoStart,      // B: repo start <branch> --all
+    RepoAbandon,    // A: repo abandon <branch>
+    RepoForall,     // :: repo forall -c <cmd>
+    RepoDownload,   // D: repo download <project> <change>
+    MakeBuild,      // M: make -j{jobs}
+    MakeClean,      // C: make clean
+    #[allow(dead_code)]
+    MakeClobber,    // (future: make clobber)
+}
+
+impl AospOp {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AospOp::RepoSync => "repo sync -c --no-tags",
+            AospOp::RepoSyncN => "repo sync -n (fetch only)",
+            AospOp::RepoStatus => "repo status",
+            AospOp::RepoBranches => "repo branches",
+            AospOp::RepoOverview => "repo overview",
+            AospOp::RepoManifest => "manifest.xml",
+            AospOp::RepoStart => "repo start <branch> --all",
+            AospOp::RepoAbandon => "repo abandon <branch>",
+            AospOp::RepoForall => "repo forall -c <cmd>",
+            AospOp::RepoDownload => "repo download <project> <change>",
+            AospOp::MakeBuild => "make -j{jobs}",
+            AospOp::MakeClean => "make clean",
+            AospOp::MakeClobber => "make clobber",
+        }
+    }
+
+    pub fn prompt_hint(&self) -> Option<&'static str> {
+        match self {
+            AospOp::RepoStart => Some("Branch name"),
+            AospOp::RepoAbandon => Some("Branch name to abandon"),
+            AospOp::RepoForall => Some("Command (e.g. git log -1 --oneline)"),
+            AospOp::RepoDownload => Some("project change-id  (e.g. platform/frameworks/base 12345)"),
+            _ => None,
+        }
+    }
+}
+
+/// Events streamed from a background AOSP command thread
+#[derive(Debug, Clone)]
+pub enum AospEvent {
+    Line(String),
+    Done(bool), // true = success
+}
+
+/// Active keyboard input mode
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Filter,
+    AospPrompt(AospOp),  // waiting for text input before executing op
+    AospConfirm(AospOp), // waiting for y/n before executing destructive op
+}
+
+/// TUI overlay variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Help,
     Detail,
     Diff,
+    AospCommand,  // scrollable command output
+    AospManifest, // read-only manifest.xml view
+    AospConfirm,  // destructive-op confirmation dialog
+    AospPrompt,   // single-line text input box
 }
