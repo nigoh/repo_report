@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# repo-report: scan nested git repositories in parallel and report
+#              branch / HEAD / dirty / ahead-behind / up-to-date status.
+#
+# Designed for workspaces managed by Google's `repo` tool (.repo/...) or
+# any tree that contains many nested git checkouts. Works with both
+# `.git` directories and `.git` gitfile pointers (submodules / repo tool).
+#
+# Dependencies: bash >= 4, git, find, xargs, awk. `column` optional.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+ROOT="."
+JOBS="$(nproc 2>/dev/null || echo 4)"
+FETCH=0
+FORMAT="table"
+MAX_DEPTH=""
+MSG_WIDTH=60
+
+usage() {
+  cat <<EOF
+repo-report v${VERSION}
+  Scan a directory tree for git repositories and report their status
+  in parallel. Intended for workspaces managed by \`repo\` (.repo/...)
+  or any tree with many nested checkouts.
+
+Usage:
+  repo-report [OPTIONS] [PATH]
+
+Options:
+  -j, --jobs N         Parallel workers (default: nproc = ${JOBS})
+  -f, --fetch          Run \`git fetch --all --prune\` before reporting
+                       (network; required for accurate behind counts)
+      --format FMT     Output format: table | tsv | json (default: table)
+      --max-depth N    Limit find depth
+      --msg-width N    Truncate commit message to N chars (table; default 60)
+  -h, --help           Show this help
+  -V, --version        Show version
+
+Arguments:
+  PATH                 Root to scan (default: current directory).
+                       For a repo-tool workspace, pass the workspace root
+                       (the directory that contains .repo), not .repo itself,
+                       so the actual checkouts are discovered.
+
+Output columns:
+  repo      relative path to the working tree
+  branch    current branch (or detached HEAD)
+  sha       short HEAD hash
+  date      HEAD commit date (ISO 8601)
+  ahead     commits HEAD is ahead of upstream
+  behind    commits HEAD is behind upstream
+  dirty     clean | dirty (uncommitted changes)
+  status    up-to-date | behind | ahead | diverged | no-upstream | dirty
+  remote    origin URL
+  message   HEAD commit subject
+
+Examples:
+  repo-report                          # scan cwd
+  repo-report -j 32 --fetch .          # full refresh, 32 workers
+  repo-report --format json . > r.json # machine readable
+  repo-report --format tsv . | awk -F'\\t' '\$8=="behind"'
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -j|--jobs)      JOBS="$2"; shift 2;;
+    -f|--fetch)     FETCH=1; shift;;
+    --format)       FORMAT="$2"; shift 2;;
+    --max-depth)    MAX_DEPTH="$2"; shift 2;;
+    --msg-width)    MSG_WIDTH="$2"; shift 2;;
+    -h|--help)      usage; exit 0;;
+    -V|--version)   echo "$VERSION"; exit 0;;
+    --)             shift; ROOT="${1:-.}"; shift || true;;
+    -*)             echo "repo-report: unknown option: $1" >&2; exit 2;;
+    *)              ROOT="$1"; shift;;
+  esac
+done
+
+case "$FORMAT" in table|tsv|json) ;; *)
+  echo "repo-report: invalid --format: $FORMAT" >&2; exit 2;;
+esac
+
+if [[ ! -d "$ROOT" ]]; then
+  echo "repo-report: not a directory: $ROOT" >&2
+  exit 1
+fi
+
+# ------------------------------------------------------------------
+# Discover repositories.
+# Match .git as directory OR file (gitfile). `-prune` stops descent
+# into the match so we don't walk into .git internals.
+# ------------------------------------------------------------------
+find_opts=()
+[[ -n "$MAX_DEPTH" ]] && find_opts+=(-maxdepth "$MAX_DEPTH")
+
+mapfile -t GIT_PATHS < <(
+  find "$ROOT" "${find_opts[@]}" -name .git \( -type d -o -type f \) -prune 2>/dev/null \
+    | sort -u
+)
+
+if [[ ${#GIT_PATHS[@]} -eq 0 ]]; then
+  echo "repo-report: no git repositories found under: $ROOT" >&2
+  exit 0
+fi
+
+# ------------------------------------------------------------------
+# Worker: emit one TSV line per repository.
+# Lines stay well under PIPE_BUF (4096 on Linux) so concurrent writes
+# from xargs -P are atomic on stdout.
+# ------------------------------------------------------------------
+_report_one() {
+  local gitpath="$1"
+  local repo="${gitpath%/.git}"
+  [[ -z "$repo" ]] && repo="."
+
+  local branch sha date msg remote upstream ahead behind dirty status porcelain
+
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  if [[ "$branch" == "HEAD" ]]; then
+    branch="(detached)"
+  fi
+  sha=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo "-")
+  date=$(git -C "$repo" log -1 --format=%cI 2>/dev/null || echo "-")
+  msg=$(git -C "$repo" log -1 --format=%s 2>/dev/null | tr '\t\r\n' '   ')
+  remote=$(git -C "$repo" config --get remote.origin.url 2>/dev/null || echo "-")
+
+  if [[ "${REPO_REPORT_FETCH:-0}" -eq 1 ]]; then
+    git -C "$repo" fetch --quiet --all --prune 2>/dev/null || true
+  fi
+
+  upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+  ahead=0; behind=0
+  if [[ -n "$upstream" ]]; then
+    if read -r ahead behind < <(git -C "$repo" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null); then
+      :
+    else
+      ahead=0; behind=0
+    fi
+  fi
+
+  porcelain=$(git -C "$repo" status --porcelain 2>/dev/null || true)
+  if [[ -n "$porcelain" ]]; then dirty="dirty"; else dirty="clean"; fi
+
+  if [[ -z "$upstream" ]]; then
+    status="no-upstream"
+  elif [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then
+    status="up-to-date"
+  elif [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+    status="diverged"
+  elif [[ "$behind" -gt 0 ]]; then
+    status="behind"
+  else
+    status="ahead"
+  fi
+  # dirty overrides an otherwise-clean up-to-date state, but we keep
+  # both columns so callers can filter independently.
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$repo" "$branch" "$sha" "$date" "$ahead" "$behind" "$dirty" "$status" "$remote" "$msg"
+}
+export -f _report_one
+export REPO_REPORT_FETCH="$FETCH"
+
+# ------------------------------------------------------------------
+# Run workers in parallel. NUL-delimited to survive odd paths.
+# ------------------------------------------------------------------
+TSV=$(
+  printf '%s\0' "${GIT_PATHS[@]}" \
+    | xargs -0 -n1 -P "$JOBS" bash -c '_report_one "$1"' bash \
+    | sort
+)
+
+# ------------------------------------------------------------------
+# Emit in requested format.
+# ------------------------------------------------------------------
+emit_tsv() {
+  printf 'repo\tbranch\tsha\tdate\tahead\tbehind\tdirty\tstatus\tremote\tmessage\n'
+  printf '%s\n' "$TSV"
+}
+
+emit_table() {
+  local w="$MSG_WIDTH"
+  {
+    printf 'REPO\tBRANCH\tSHA\tDATE\tA\tB\tDIRTY\tSTATUS\tMESSAGE\n'
+    printf '%s\n' "$TSV" \
+      | awk -F'\t' -v W="$w" 'BEGIN{OFS="\t"}
+          { m=$10; if (length(m) > W) m=substr(m,1,W-1) "…";
+            # short date: keep yyyy-mm-dd
+            d=$4; if (length(d) >= 10) d=substr(d,1,10);
+            print $1,$2,$3,d,$5,$6,$7,$8,m }'
+  } | { command -v column >/dev/null 2>&1 && column -t -s $'\t' || cat; }
+}
+
+emit_json() {
+  printf '%s\n' "$TSV" | awk -F'\t' '
+    function esc(s,   r){ r=s;
+      gsub(/\\/, "\\\\", r);
+      gsub(/"/,  "\\\"", r);
+      gsub(/\t/, "\\t",  r);
+      gsub(/\n/, "\\n",  r);
+      gsub(/\r/, "\\r",  r);
+      return r
+    }
+    BEGIN{ print "["; first=1 }
+    NF==0 { next }
+    {
+      if (!first) printf ",\n"; first=0
+      printf "  {\"repo\":\"%s\",\"branch\":\"%s\",\"sha\":\"%s\",\"date\":\"%s\",\"ahead\":%d,\"behind\":%d,\"dirty\":\"%s\",\"status\":\"%s\",\"remote\":\"%s\",\"message\":\"%s\"}",
+        esc($1), esc($2), esc($3), esc($4), $5+0, $6+0, esc($7), esc($8), esc($9), esc($10)
+    }
+    END{ if (!first) printf "\n"; print "]" }
+  '
+}
+
+case "$FORMAT" in
+  tsv)   emit_tsv   ;;
+  json)  emit_json  ;;
+  table) emit_table ;;
+esac
+
+# Exit code: 0 if every repo up-to-date & clean, 1 otherwise (CI friendly)
+if printf '%s\n' "$TSV" | awk -F'\t' '$7!="clean" || ($8!="up-to-date" && $8!="no-upstream") { bad=1 } END{ exit bad?1:0 }'; then
+  exit 0
+else
+  exit 1
+fi
